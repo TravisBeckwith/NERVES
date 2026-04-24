@@ -1,0 +1,54 @@
+cff-version: 1.2.0
+message: "If you use NERVES, please cite it using the metadata below."
+type: software
+title: "NERVES: Normalized Entropy Representation of Voxelwise Eigenvalue Spectra"
+version: 1.0.0
+date-released: 2025-XX-XX
+license: MIT
+repository-code: https://github.com/yourusername/NERVES
+abstract: >
+  NERVES is an end-to-end pipeline for computing Normalized Diffusion Entropy
+  (NDE) maps from diffusion-weighted MRI data. NDE quantifies the Shannon entropy
+  of the diffusion tensor eigenvalue spectrum and provides microstructural
+  sensitivity complementary to Fractional Anisotropy (FA), particularly for
+  detecting minor-eigenvalue redistribution in pathologies such as Wallerian
+  degeneration and crossing-fibre configurations.
+authors:
+  - family-names: "Author"
+    given-names: "A."
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+keywords:
+  - diffusion MRI
+  - DTI
+  - white matter
+  - entropy
+  - microstructure
+  - neuroimaging
+  - Fractional Anisotropy
+  - Normalized Diffusion Entropy
+references:
+  - type: article
+    title: >
+      Characterizing brain structures and remodeling after TBI based on
+      information content, diffusion entropy
+    authors:
+      - family-names: Fozouni
+        given-names: N.
+      - family-names: Chopp
+        given-names: M.
+      - family-names: Nejad-Davarani
+        given-names: S. P.
+      - family-names: Zhang
+        given-names: Z. G.
+      - family-names: Lehman
+        given-names: N. L.
+      - family-names: Gu
+        given-names: S.
+      - family-names: Jiang
+        given-names: Q.
+    journal: PLoS One
+    volume: 8
+    issue: 10
+    pages: e76343
+    year: 2013
+    doi: 10.1371/journal.pone.0076343
