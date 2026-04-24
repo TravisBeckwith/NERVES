@@ -3,9 +3,9 @@ message: "If you use NERVES, please cite it using the metadata below."
 type: software
 title: "NERVES: Normalized Entropy Representation of Voxelwise Eigenvalue Spectra"
 version: 1.0.0
-date-released: 2025-XX-XX
+date-released: 2026-04-26
 license: MIT
-repository-code: https://github.com/yourusername/NERVES
+repository-code: https://github.com/TravisBeckwith/NERVES
 abstract: >
   NERVES is an end-to-end pipeline for computing Normalized Diffusion Entropy
   (NDE) maps from diffusion-weighted MRI data. NDE quantifies the Shannon entropy
@@ -14,9 +14,9 @@ abstract: >
   detecting minor-eigenvalue redistribution in pathologies such as Wallerian
   degeneration and crossing-fibre configurations.
 authors:
-  - family-names: "Author"
-    given-names: "A."
-    orcid: "https://orcid.org/0000-0000-0000-0000"
+  - family-names: "Beckwith"
+    given-names: "Travis J."
+    orcid: "https://orcid.org/0000-0001-6128-8464"
 keywords:
   - diffusion MRI
   - DTI
