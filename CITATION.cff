@@ -3,7 +3,8 @@ message: "If you use NERVES, please cite it using the metadata below."
 type: software
 title: "NERVES: Normalized Entropy Representation of Voxelwise Eigenvalue Spectra"
 version: 1.0.0
-date-released: 2026-04-26
+date-released: 2026-04-24
+doi: 10.5281/zenodo.19738588
 license: MIT
 repository-code: https://github.com/TravisBeckwith/NERVES
 abstract: >

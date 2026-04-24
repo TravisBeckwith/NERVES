@@ -7,7 +7,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![DOI](https://img.shields.io/badge/DOI-10.xxxx%2Fxxxxxx-orange)](https://doi.org/)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19738588-orange)](https://doi.org/10.5281/zenodo.19738588)
 [![FSL](https://img.shields.io/badge/requires-FSL%206.0%2B-blueviolet)](https://fsl.fmrib.ox.ac.uk/)
 [![MRtrix3](https://img.shields.io/badge/requires-MRtrix3%203.0%2B-blueviolet)](https://www.mrtrix.org/)
 
@@ -243,13 +243,13 @@ NERVES applies the following automated QC checks and records pass/fail in the JS
 If you use NERVES in your research, please cite:
 
 ```bibtex
-@article{nerves2025,
+@software{beckwith2026nerves,
   title   = {{NERVES}: Normalized Entropy Representation of Voxelwise
-             Eigenvalue Spectra for microstructural diffusion mapping},
-  author  = {Author, A. and Author, B.},
-  journal = {Journal Name},
-  year    = {2025},
-  doi     = {10.xxxx/xxxxxx}
+             Eigenvalue Spectra},
+  author  = {Beckwith, Travis J.},
+  year    = {2026},
+  url     = {https://github.com/TravisBeckwith/NERVES},
+  doi     = {10.5281/zenodo.19738588}
 }
 ```
 
@@ -260,8 +260,7 @@ Additionally, please cite the foundational NDE work:
   title   = {Characterizing brain structures and remodeling after {TBI}
              based on information content, diffusion entropy},
   author  = {Fozouni, N. and Chopp, M. and Nejad-Davarani, S.P. and
-             Zhang, Z.G. and Lehman, N.L. and Gu, S. and others and
-             Jiang, Q.},
+             Zhang, Z.G. and Lehman, N.L. and Gu, S. and Jiang, Q.},
   journal = {PLoS One},
   volume  = {8},
   number  = {10},
