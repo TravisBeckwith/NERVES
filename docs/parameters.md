@@ -21,12 +21,7 @@
 | `--pe_dir` | `AP` | Phase-encode direction: `AP`, `PA`, `LR`, or `RL` |
 | `--rpe_b0` | None | Reverse phase-encode b=0 volume for topup distortion correction |
 | `--no_topup` | False | Skip topup even when `--rpe_b0` is supplied |
-
-> **Note on readout time:** The default readout time is set to 0.05 s in
-> `nde_pipeline.py`. Update the `readout_time` variable near line 100 to
-> match your acquisition. This value is scanner- and sequence-dependent
-> and should be derived from your DICOM headers (typically
-> `EffectiveEchoSpacing × (PhaseEncodingSteps − 1)`).
+| `--readout_time` | `0.05` | Total readout time in seconds for topup/eddy `acqparams.txt`. Scanner- and sequence-dependent — derive from your DICOM headers as `EffectiveEchoSpacing × (PhaseEncodingSteps − 1)`. The default is a placeholder, not a measured value for your acquisition — set this explicitly for real data. |
 
 ### Registration
 
@@ -51,10 +46,16 @@ from a separate preprocessing pipeline or from FSL `dtifit`).
 | `--l2` | Yes | λ₂ NIfTI map |
 | `--l3` | Yes | λ₃ NIfTI map |
 | `--mask` | Yes | Brain mask NIfTI (binary) |
+| `--fa` | No | FA NIfTI, for QC plots. If omitted, NERVES looks for a file next to `--l1` with `L1` replaced by `FA` (e.g. `dti_L1.nii.gz` → `dti_FA.nii.gz`) — this only works if your `--l1` filename literally contains `L1`. If it doesn't (or you just want to be explicit), pass `--fa` directly. |
+| `--md` | No | MD NIfTI, for QC plots. Same auto-detection / override behavior as `--fa`. |
 
 > When using `--skip_preproc`, the `--dwi`, `--bval`, `--bvec`, and `--t1`
 > arguments are still required by the argument parser but are not used.
 > Pass placeholder values (e.g., `x`) for these.
+>
+> If neither `--fa` nor a same-directory `..._FA.nii.gz` is found, NERVES
+> logs a warning and skips the QC figures — the NDE map itself is still
+> computed and written normally.
 
 ### Optional Pre-computed Tissue Maps
 

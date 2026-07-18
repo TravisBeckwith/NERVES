@@ -75,7 +75,7 @@ all eigenvalues.
 | A | 1.5 | 0.5 | 0.5 | 0.603 | 0.865 | Prolate |
 | B | 1.5 | 0.75 | 0.25 | 0.643 | 0.817 | Asymmetric |
 | C | 1.2 | 0.6 | 0.6 | 0.408 | 0.946 | Prolate |
-| D | 1.2 | 0.8 | 0.4 | 0.490 | 0.921 | Asymmetric |
+| D | 1.2 | 0.8 | 0.4 | 0.463 | 0.921 | Asymmetric |
 
 Eigenvalues in units of ×10⁻³ mm²/s.
 

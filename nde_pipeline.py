@@ -68,6 +68,7 @@ Usage
         [--pe_dir AP]             \\
         [--rpe_b0 sub-01_b0_PA.nii.gz]  \\
         [--no_topup]              \\
+        [--readout_time 0.062]    \\
         [--use_ants]              \\
         [--skip_preproc]          \\
         [--l1 dti_L1.nii.gz --l2 dti_L2.nii.gz --l3 dti_L3.nii.gz \\
@@ -175,10 +176,21 @@ def validate_tools(use_ants: bool = False) -> None:
 
 def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
                    out_dir: Path, pe_dir: str = "AP",
-                   rpe_b0: Optional[Path] = None) -> dict:
+                   rpe_b0: Optional[Path] = None,
+                   readout_time: float = 0.05) -> dict:
     """
     Full DWI preprocessing:
       denoising → Gibbs removal → topup (optional) → eddy → bet mask
+
+    Parameters
+    ----------
+    readout_time : float
+        Total readout time in seconds, used in acqparams.txt for topup and
+        eddy. Scanner- and sequence-dependent — derive it from your DICOM
+        headers as EffectiveEchoSpacing x (PhaseEncodingSteps - 1). The
+        default (0.05s) is a placeholder, not a measured value for your
+        acquisition; pass --readout_time on the command line to set it
+        correctly rather than editing this default.
 
     Returns dict of output paths.
     """
@@ -220,7 +232,6 @@ def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
     topup_results = None
     acqparams = out_dir / "acqparams.txt"
 
-    readout_time = 0.05  # seconds — update to match your acquisition
     pe_map = {
         "AP": (0, -1, 0), "PA": (0, 1, 0),
         "LR": (-1, 0, 0), "RL": (1, 0, 0),
@@ -659,14 +670,14 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
         if len(csf_vals) > 50:
             csf_mean = float(csf_vals.mean())
             qc_results["csf_nde_mean"] = csf_mean
-            qc_results["csf_nde_pass"] = csf_mean >= 0.90
+            qc_results["csf_nde_pass"] = bool(csf_mean >= 0.90)
             if not qc_results["csf_nde_pass"]:
                 log.warning("QC FAIL: Mean NDE in CSF = %.3f (expected ≥ 0.90)",
                             csf_mean)
         if len(wm_vals) > 50:
             wm_mean = float(wm_vals.mean())
             qc_results["wm_nde_mean"] = wm_mean
-            qc_results["wm_nde_pass"] = wm_mean < 0.85
+            qc_results["wm_nde_pass"] = bool(wm_mean < 0.85)
             if not qc_results["wm_nde_pass"]:
                 log.warning("QC WARN: Mean NDE in WM = %.3f (expected < 0.85)."
                             " Check preprocessing quality.", wm_mean)
@@ -683,7 +694,7 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
 
     r, pval = pearsonr(fa_wm[idx], nde_wm[idx])
     qc_results["nde_fa_pearson_r"] = float(r)
-    qc_results["nde_fa_anticorrelated"] = r < -0.80
+    qc_results["nde_fa_anticorrelated"] = bool(r < -0.80)
 
     fig, ax = plt.subplots(figsize=(8, 7))
     ax.scatter(fa_wm[idx], nde_wm[idx], s=1, alpha=0.15,
@@ -762,6 +773,32 @@ def _make_montage(nde: np.ndarray, fa: np.ndarray, md: np.ndarray,
 def write_report(out_dir: Path, nde_stats: dict, qc_results: dict,
                  args_dict: dict) -> None:
     """Write a JSON summary report."""
+
+    class _NumpySafeEncoder(json.JSONEncoder):
+        """Fallback encoder for numpy scalar types.
+
+        nde_stats and qc_results are built from numpy computations
+        throughout the pipeline (np.mean, np.std, scipy.stats.pearsonr,
+        comparisons against numpy floats, ...). It's easy for a numpy
+        scalar (np.float32/64, np.int32/64, np.bool_) to end up in one of
+        these dicts undetected, since numpy scalars behave like Python
+        scalars in almost every context except json.dump(), which raises
+        TypeError on them. This encoder converts them instead of crashing
+        report writing — see CHANGELOG for the nde_fa_anticorrelated bug
+        this exact failure mode caused.
+        """
+
+        def default(self, obj):
+            if isinstance(obj, np.bool_):
+                return bool(obj)
+            if isinstance(obj, np.integer):
+                return int(obj)
+            if isinstance(obj, np.floating):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return super().default(obj)
+
     report = {
         "pipeline": "nde_pipeline.py",
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -783,7 +820,7 @@ def write_report(out_dir: Path, nde_stats: dict, qc_results: dict,
     }
     rpt_path = out_dir / "nde_pipeline_report.json"
     with open(rpt_path, "w") as f:
-        json.dump(report, f, indent=2)
+        json.dump(report, f, indent=2, cls=_NumpySafeEncoder)
     log.info("Report written: %s", rpt_path)
 
 
@@ -818,6 +855,13 @@ def parse_args() -> argparse.Namespace:
                    help="Reverse phase-encode b=0 volume for topup")
     p.add_argument("--no_topup", action="store_true",
                    help="Skip topup even if --rpe_b0 is supplied")
+    p.add_argument("--readout_time", type=float, default=0.05,
+                   help="Total readout time in seconds for topup/eddy "
+                        "acqparams.txt. Scanner- and sequence-dependent — "
+                        "derive from DICOM headers as EffectiveEchoSpacing "
+                        "x (PhaseEncodingSteps - 1). Default 0.05s is a "
+                        "placeholder, not a measured value; set this "
+                        "explicitly for real data. (default: %(default)s)")
     p.add_argument("--use_ants", action="store_true",
                    help="Use ANTs SyN for T1→DWI registration (default: FLIRT)")
 
@@ -833,6 +877,14 @@ def parse_args() -> argparse.Namespace:
                    help="Pre-computed λ₃ NIfTI (use with --skip_preproc)")
     p.add_argument("--mask", type=Path, default=None,
                    help="Brain mask NIfTI (use with --skip_preproc)")
+    p.add_argument("--fa", type=Path, default=None,
+                   help="Pre-computed FA NIfTI, for QC plots (use with "
+                        "--skip_preproc). Overrides dtifit-naming "
+                        "auto-detection from --l1; use this if your files "
+                        "don't follow the ..._L1/..._FA convention.")
+    p.add_argument("--md", type=Path, default=None,
+                   help="Pre-computed MD NIfTI, for QC plots (use with "
+                        "--skip_preproc). Same override behavior as --fa.")
 
     # --- Optional pre-computed PVE maps ---
     p.add_argument("--pve_csf", type=Path, default=None,
@@ -891,6 +943,7 @@ def main() -> None:
             out_dir=out_dir / "preproc",
             pe_dir=args.pe_dir,
             rpe_b0=rpe_b0,
+            readout_time=args.readout_time,
         )
         mask_path = preproc["mask"]
 
@@ -935,14 +988,34 @@ def main() -> None:
             log.error("--skip_preproc requires: %s", ", ".join(missing))
             sys.exit(1)
         # Derive FA / MD paths if they exist alongside the eigenvalues
-        # (assume dtifit naming convention)
-        candidate_fa = l1_path.parent / l1_path.name.replace("L1", "FA")
-        candidate_md = l1_path.parent / l1_path.name.replace("L1", "MD")
-        fa_path = candidate_fa if candidate_fa.exists() else None
-        md_path = candidate_md if candidate_md.exists() else None
+        # (assume dtifit naming convention: ..._L1.nii.gz -> ..._FA.nii.gz).
+        # --fa/--md, if given, always take priority over auto-detection.
+        # Guard on "L1" actually being in the filename first: str.replace()
+        # silently no-ops otherwise, which previously made candidate_fa
+        # equal to l1_path itself (since that file obviously exists) and
+        # fed the eigenvalue map into run_qc() as if it were FA data.
+        if args.fa is not None:
+            fa_path = args.fa
+        elif "L1" in l1_path.name:
+            candidate_fa = l1_path.parent / l1_path.name.replace("L1", "FA")
+            fa_path = candidate_fa if candidate_fa.exists() else None
+        else:
+            fa_path = None
+
+        if args.md is not None:
+            md_path = args.md
+        elif "L1" in l1_path.name:
+            candidate_md = l1_path.parent / l1_path.name.replace("L1", "MD")
+            md_path = candidate_md if candidate_md.exists() else None
+        else:
+            md_path = None
+
         if fa_path is None:
-            log.warning("FA map not found alongside L1; QC scatter plot "
-                        "will be skipped.")
+            log.warning("FA map not found alongside L1 (expected dtifit "
+                        "naming convention, e.g. ..._L1.nii.gz / "
+                        "..._FA.nii.gz); QC scatter plot will be skipped. "
+                        "Pass --fa (and --md) explicitly if your files use "
+                        "different names.")
 
     # ------------------------------------------------------------------
     # Step 5: NDE computation
