@@ -100,7 +100,7 @@ Raw DWI + T1
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/NERVES.git
+git clone https://github.com/TravisBeckwith/NERVES.git
 cd NERVES
 
 # Create and activate a virtual environment (recommended)
