@@ -84,3 +84,13 @@ Documentation lives in `docs/`. Edits to the theory, parameters, QC
 guide, or troubleshooting pages are always welcome. For substantial
 changes to the mathematical content in `docs/theory.md`, please link
 to or attach the relevant reference.
+
+---
+
+## Tests and validation
+
+Run `python -m pytest -m "not integration" -q` before opening a PR (see
+[docs/testing.md](docs/testing.md)). Changes to the tensor fit, NDE or QC logic should
+come with a test against known tensors (the synthetic phantom in `validation/make_phantom.py`
+is the easiest way). Claims of added sensitivity or reliability for any metric should be
+backed by `validation/noise_simulation.py` or `validation/retest_reliability.py` output.

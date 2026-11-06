@@ -552,8 +552,9 @@ class TestCommandConstruction:
         assert not any(a == "|" for a in flat)               # no shell pipes
         names = [c[0] for c in calls]
         assert "applytopup" in names                         # mask from corrected b0
-        assert names.index("applytopup") < names.index("eddy")
-        eddy = next(c for c in calls if c[0] == "eddy")
+        eddy_name = next(n for n in names if n.startswith("eddy"))
+        assert names.index("applytopup") < names.index(eddy_name)
+        eddy = next(c for c in calls if c[0] == eddy_name)
         assert any(a.startswith("--topup=") for a in eddy)
 
     def test_ants_uses_affine_only_and_is_labelled_so(self, tmp_path, monkeypatch):
