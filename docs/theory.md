@@ -101,9 +101,42 @@ white-matter-like range (`tests/test_complementarity.py`):
 
 At fixed FA, NDE does vary with the λ₂/λ₃ split, so it carries mode-like information
 beyond FA. That information is available directly from tensor mode, which has an
-established interpretation (prolate vs oblate). Any claim that NDE is more sensitive
-than FA (or mode) to a particular pathology needs empirical validation that this
-repository does not provide.
+established interpretation (prolate vs oblate).
+
+### Behaviour under noise (Monte-Carlo, `validation/noise_simulation.py`)
+
+Simulation: 30 directions at b = 1000 (+3 b=0), Rician noise, randomly oriented
+tensors, 20 000 voxels per condition, ordinary least squares.
+
+*Precision and bias* for a WM-like tensor (λ = 1.7/0.35/0.30; true FA 0.781, NDE 0.711,
+mode 0.996):
+
+| SNR | negative-eigenvalue voxels | FA | NDE | Mode |
+|---|---|---|---|---|
+| 10 | 0.6 % | 0.782 ± 0.066 | 0.687 ± 0.096 | 0.936 ± 0.066 |
+| 15 | 0.0 % | 0.783 ± 0.046 | 0.698 ± 0.063 | 0.970 ± 0.031 |
+| 25 | 0.0 % | 0.782 ± 0.027 | 0.706 ± 0.036 | 0.986 ± 0.013 |
+| 40 | 0.0 % | 0.781 ± 0.017 | 0.709 ± 0.022 | 0.992 ± 0.007 |
+
+NDE is biased low at low SNR (FA is essentially unbiased here), and mode is biased too.
+With weighted least squares at SNR 10 the negative-eigenvalue fraction fell from 0.65 %
+to 0.13 %, the NDE SD from 0.095 to 0.078 and the NDE bias from −0.025 to −0.011.
+
+*Discriminability* d′ = |Δmean| / pooled SD at SNR 25:
+
+| Scenario | FA | MD | NDE | Mode |
+|---|---|---|---|---|
+| A: same FA and trace, different λ₂/λ₃ split (1.6/0.45/0.20 vs matched 1.61/0.32/0.32) | 0.01 | 0.01 | 0.36 | 3.32 |
+| B: symmetric radial diffusivity increase (1.7/0.35/0.30 → 1.6/0.45/0.40) | 3.18 | 1.12 | 3.09 | 0.39 |
+| C: λ₂/λ₃ redistribution (1.7/0.40/0.25 → 1.7/0.30/0.35) | 0.06 | 0.01 | 0.16 | 1.55 |
+
+For FA-like changes (B) NDE performs like FA; for the λ₂/λ₃ changes it is claimed to
+capture (A, C) mode is roughly an order of magnitude more sensitive. Limitations: single-fibre
+tensors, one acquisition scheme, no partial-volume or crossing-fibre effects, voxelwise
+(not ROI-averaged) statistics. Any claim that NDE is more sensitive than FA or mode to a
+particular pathology still needs empirical validation, for example with
+`validation/retest_reliability.py` on test-retest data and with real patient/control
+contrasts.
 
 ---
 
@@ -113,7 +146,8 @@ repository does not provide.
 |---|---|---|
 | λ₁ = λ₂ = λ₃ (isotropic) | 1.0 | Computed normally |
 | λ₁ >> λ₂ = λ₃ (prolate) | Lower (e.g. 0.865 for λ = 1.5/0.5/0.5) | Computed normally |
-| Any λᵢ ≤ 0 | NaN (undefined) | Voxel written to QC flag mask; excluded from statistics and QC |
+| Any λᵢ ≤ 0 | NaN (undefined) | Voxel written to QC flag mask (value 1); excluded from statistics and QC |
+| SNR < `--min_snr` | NaN (undefined) | QC flag value 2; excluded from statistics and QC |
 | Outside brain mask | 0 | Not computed; excluded from statistics |
 
 NaN (rather than 0) is used for non-physical voxels because 0 is a legitimate NDE value
