@@ -8,6 +8,42 @@ NERVES uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (behaviour — may alter results)
+- **Non-physical voxels (any eigenvalue ≤ 0) are now `NaN` in `nde.nii.gz`** instead
+  of `0`, and are excluded from all summary statistics and QC. Previously they were
+  written as 0 ("maximally anisotropic") *and* counted in `nde_mean/min/percentiles`,
+  the WM/CSF checks and the NDE–FA correlation, biasing all of them. Downstream code
+  must handle NaN (e.g. `np.nanmean`, `fslmaths -nan`).
+- **QC thresholds revised.** The NDE–FA `r < −0.80` check and the absolute
+  `WM NDE < 0.85` check were removed as pass/fail criteria (`nde_fa_anticorrelated`
+  and `wm_nde_pass` no longer exist in the report): NDE and FA are functions of the
+  same eigenvalues so the correlation cannot reveal a corrupted tensor, and the WM
+  threshold was inconsistent with the documented FA range. Added
+  `tissue_ordering_pass` (mean NDE CSF > GM > WM); `nde_fa_pearson_r`, `wm_nde_mean`
+  and `gm_nde_mean` are informational.
+- External commands now run **without a shell** (argument lists); paths with spaces
+  or shell metacharacters are safe, and failures inside former pipelines
+  (`dwiextract | mrmath`) are no longer masked.
+- The eddy brain mask is now derived from the topup-corrected b0 (via `applytopup`)
+  when topup is used.
+- ANTs option is now correctly described as **rigid + affine** (it never ran a
+  nonlinear SyN stage).
+
+### Fixed
+- Shape mismatches between `--skip_preproc` inputs now exit with a clear error.
+- Removed unused `mask_ref` argument of `preprocess_t1` and the unused `seaborn` /
+  `pandas` requirements.
+
+### Documentation
+- Clarified that NDE is a **tensor-eigenvalue entropy**, not the model-free Q-ball
+  diffusion entropy of Fozouni et al. 2013 (now cited as related work only).
+- Removed unsupported claims of clinical sensitivity and of "complementarity" with FA;
+  added a quantified analysis (NDE is ≈ a function of FA and tensor mode) and
+  `tests/test_complementarity.py`.
+- Corrected the Table 1 narrative (A–B and C–D differ in FA too; |ΔNDE| > |ΔFA| holds
+  only for A–B). QC reference ranges are labelled rules of thumb.
+- Added `.github/workflows/ci.yml` to the repository.
+
 ### Added
 - `--readout_time` CLI argument — total readout time for topup/eddy
   acqparams.txt was previously hardcoded (0.05s) and required editing the

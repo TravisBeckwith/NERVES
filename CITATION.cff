@@ -10,10 +10,10 @@ repository-code: https://github.com/TravisBeckwith/NERVES
 abstract: >
   NERVES is an end-to-end pipeline for computing Normalized Diffusion Entropy
   (NDE) maps from diffusion-weighted MRI data. NDE quantifies the Shannon entropy
-  of the diffusion tensor eigenvalue spectrum and provides microstructural
-  sensitivity complementary to Fractional Anisotropy (FA), particularly for
-  detecting minor-eigenvalue redistribution in pathologies such as Wallerian
-  degeneration and crossing-fibre configurations.
+  of the diffusion tensor eigenvalue spectrum. It is a function of FA and
+  tensor mode, so any added value over FA is exploratory and unvalidated.
+  NDE is a tensor-eigenvalue summary measure; it is related to, but not the same
+  estimator as, the model-free diffusion entropy of Fozouni et al. (2013).
 authors:
   - family-names: "Beckwith"
     given-names: "Travis J."
@@ -28,6 +28,7 @@ keywords:
   - Fractional Anisotropy
   - Normalized Diffusion Entropy
 references:
+  # Related work (different, model-free estimator) -- not the source of this implementation.
   - type: article
     title: >
       Characterizing brain structures and remodeling after TBI based on
@@ -53,3 +54,29 @@ references:
     pages: e76343
     year: 2013
     doi: 10.1371/journal.pone.0076343
+  - type: article
+    title: "Generalized scalar measures for diffusion tensor imaging using trace, variance, and entropy"
+    authors:
+      - family-names: Özarslan
+        given-names: E.
+      - family-names: Vemuri
+        given-names: B. C.
+      - family-names: Mareci
+        given-names: T. H.
+    journal: Magnetic Resonance in Medicine
+    volume: 53
+    issue: 4
+    pages: "866-876"
+    year: 2005
+  - type: article
+    title: "Orthogonal tensor invariants and the analysis of diffusion tensor magnetic resonance images"
+    authors:
+      - family-names: Ennis
+        given-names: D. B.
+      - family-names: Kindlmann
+        given-names: G.
+    journal: Magnetic Resonance in Medicine
+    volume: 55
+    issue: 1
+    pages: "136-146"
+    year: 2006

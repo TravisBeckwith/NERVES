@@ -21,19 +21,30 @@
 
 ## Overview
 
-NERVES provides an end-to-end pipeline for computing **Normalized Diffusion Entropy (NDE)** maps from raw diffusion-weighted MRI data. NDE quantifies the Shannon entropy of the diffusion tensor eigenvalue spectrum, providing microstructural sensitivity that is **complementary to — not redundant with — Fractional Anisotropy (FA)**.
+NERVES provides an end-to-end pipeline for computing **Normalized Diffusion Entropy (NDE)** maps from raw diffusion-weighted MRI data. NDE is the Shannon entropy of the (normalised) diffusion tensor eigenvalue spectrum.
 
-### Why NDE?
+### What NDE is — and is not
 
-Two voxels can share identical FA yet differ substantially in NDE whenever the ratio of the minor eigenvalues (λ₂/λ₃) differs. This occurs in clinically important scenarios:
+> **Scope note.** NDE is a *scalar summary of the three tensor eigenvalues*. It is
+> **not** the model-free (Q-ball / mean-free-path) diffusion entropy of
+> Fozouni et al. 2013, which is cited as related work on entropy-based diffusion
+> contrast but uses a different estimator and sign convention.
 
-| Scenario | FA response | NDE response |
-|---|---|---|
-| Early Wallerian degeneration (asymmetric radial diffusivity loss) | Moderate | Sensitive |
-| Crossing-fiber voxels vs. single-fiber voxels | May be identical | Distinct |
-| Subtle λ₂/λ₃ redistribution at fixed anisotropy | Insensitive | Sensitive |
+Because NDE depends only on the eigenvalue *shape*, it is a deterministic function of
+two orthogonal tensor invariants, FA and tensor mode (Ennis & Kindlmann 2006). In
+simulation (see `tests/test_complementarity.py`) NDE correlates with FA at about
+r ≈ −0.94, FA alone explains ≈ 98 % of NDE variance, and FA + mode explain > 99.9 %.
+Practically:
 
-This sensitivity arises from the logarithmic weighting of the entropy function: the derivative d/dp(−p ln p) diverges as p → 0, making NDE disproportionately responsive to changes in small eigenvalue proportions.
+- At **fixed FA**, NDE still varies with how the minor eigenvalues split (λ₂ vs λ₃),
+  i.e. with tensor mode. That is the only information NDE adds to FA.
+- Tensor mode captures that same information directly and has an established
+  interpretation. If you need the λ₂/λ₃ contrast, report mode alongside NDE.
+- Claims that NDE is more sensitive than FA to Wallerian degeneration, crossing
+  fibres, etc. are **hypotheses, not results of this repository**: no clinical or
+  phantom validation data are included. Treat NDE as an exploratory metric.
+- Like FA, NDE is biased by noise (eigenvalue sorting inflates λ₁ and deflates λ₃),
+  so low-SNR acquisitions will shift values.
 
 ### Mathematical Definition
 
@@ -50,7 +61,8 @@ Normalised to [0, 1]:
 $$\text{NDE} = \frac{H}{\ln(3)}$$
 
 - **NDE = 1** → perfectly isotropic (λ₁ = λ₂ = λ₃)  
-- **NDE = 0** → maximally anisotropic (all diffusion along one eigenvector)
+- **NDE → 0** → maximally anisotropic (all diffusion along one eigenvector)
+- **NDE = NaN** → undefined: at least one eigenvalue ≤ 0 (flagged in `nde_qc_flag.nii.gz`)
 
 ---
 
@@ -69,7 +81,7 @@ Raw DWI + T1
      ├── T1 Preprocessing
      │     ├── Brain extraction       (FSL: bet)
      │     ├── Tissue segmentation    (FSL: fast)
-     │     └── Registration → DWI    (FSL: flirt or ANTs)
+     │     └── Registration → DWI    (FSL: flirt 6-DOF, or ANTs rigid+affine)
      │
      ├── Tensor Estimation            (FSL: dtifit)
      │
@@ -164,7 +176,7 @@ python nde_pipeline.py \
     --out  ./nerves_output
 ```
 
-### ANTs Registration (Recommended for High-Resolution T1)
+### ANTs Registration (rigid + affine)
 
 ```bash
 python nde_pipeline.py \
@@ -202,7 +214,7 @@ sub-01_nerves/
 │   ├── dti_MD.nii.gz             # Mean diffusivity
 │   └── dti_RD.nii.gz             # Radial diffusivity = (λ₂+λ₃)/2
 ├── nde/
-│   ├── nde.nii.gz                # ★ PRIMARY OUTPUT: NDE map
+│   ├── nde.nii.gz                # ★ PRIMARY OUTPUT: NDE map (NaN where undefined)
 │   └── nde_qc_flag.nii.gz        # Voxels with non-physical eigenvalues
 ├── qc/
 │   ├── qc_histograms.png         # NDE / FA / MD distributions in WM
@@ -216,14 +228,19 @@ sub-01_nerves/
 
 ## QC Thresholds
 
-NERVES applies the following automated QC checks and records pass/fail in the JSON report:
+NERVES applies the following automated sanity checks and records them in the JSON report.
+They are coarse screens, **not** validated quality criteria; always inspect the QC figures.
 
-| Metric | Expected value | Interpretation if failed |
+| Metric | Expected | Interpretation if failed |
 |---|---|---|
-| Non-physical eigenvalue rate | < 5% | Tensor fitting or masking issue |
-| CSF mean NDE | ≥ 0.90 | Near-isotropic CSF correctly measured |
-| WM mean NDE | < 0.85 | Anisotropic WM correctly differentiated |
-| NDE–FA Pearson r (WM) | < −0.80 | Expected strong anticorrelation |
+| Non-physical eigenvalue rate | < 5% (exit code 2 otherwise) | Tensor fitting or masking issue |
+| CSF mean NDE (`csf_nde_pass`) | ≥ 0.90 | Registration / segmentation / tensor fit problem |
+| Tissue ordering (`tissue_ordering_pass`) | mean NDE CSF > GM > WM | Registration / segmentation / tensor fit problem |
+
+The NDE–FA Pearson r and absolute WM mean NDE are **reported for information only**.
+NDE and FA are computed from the same eigenvalues, so they stay strongly anticorrelated
+even for badly corrupted tensors, and absolute WM NDE depends on b-value, SNR,
+resolution and how WM is defined.
 
 ---
 
@@ -253,7 +270,8 @@ If you use NERVES in your research, please cite:
 }
 ```
 
-Additionally, please cite the foundational NDE work:
+Related work on entropy-based diffusion contrast (a different, model-free estimator —
+cite it for context, not as the source of this implementation):
 
 ```bibtex
 @article{fozouni2013,
@@ -269,6 +287,11 @@ Additionally, please cite the foundational NDE work:
   doi     = {10.1371/journal.pone.0076343}
 }
 ```
+
+Closely related tensor-based scalar measures, which you may also wish to cite:
+Özarslan E, Vemuri BC, Mareci TH. *Magn Reson Med* 2005;53(4):866–876
+(trace, variance and entropy measures); Ennis DB, Kindlmann G. *Magn Reson Med*
+2006;55(1):136–146 (orthogonal invariants, tensor mode).
 
 ---
 

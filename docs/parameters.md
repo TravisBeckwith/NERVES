@@ -27,7 +27,7 @@
 
 | Argument | Default | Description |
 |---|---|---|
-| `--use_ants` | False | Use ANTs SyN nonlinear registration for T1→DWI (default: FSL FLIRT 6-DOF affine) |
+| `--use_ants` | False | Use ANTs rigid + affine registration for T1→DWI (default: FSL FLIRT 6-DOF). No nonlinear (SyN) stage is run |
 
 ANTs registration is recommended when:
 - T1 and DWI have significant field-of-view differences

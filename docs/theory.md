@@ -2,20 +2,22 @@
 
 ## Background
 
-Fractional Anisotropy (FA) is the most widely used scalar diffusion tensor metric,
-but it applies a **quadratic (L2-norm) weighting** across all three eigenvalues.
-This means FA treats changes in the dominant eigenvalue (λ₁) and the minor
-eigenvalues (λ₂, λ₃) with equal mathematical weight.
+Fractional Anisotropy (FA) is the most widely used scalar diffusion tensor metric.
+It is the normalised standard deviation of the eigenvalues, i.e. a quadratic
+(L2-type) summary.
 
-In many pathological states — particularly those affecting radial diffusivity
-asymmetrically, such as early Wallerian degeneration or crossing-fiber
-configurations — the clinically meaningful change occurs in the **ratio of
-the minor eigenvalues**, not in the dominant eigenvalue. FA is relatively
-insensitive to this redistribution.
+**Normalized Diffusion Entropy (NDE)** as implemented here is the Shannon entropy of
+the eigenvalue proportions pᵢ = λᵢ / Σλ, divided by ln 3. It is a purely
+*tensor-based* quantity.
 
-Normalized Diffusion Entropy (NDE) addresses this gap by applying a
-**logarithmic weighting** via Shannon entropy, which is disproportionately
-sensitive to changes in small probability values.
+> **Relation to Fozouni et al. 2013.** That paper computes a *model-free* diffusion
+> entropy from the probability distribution of path lengths estimated with Q-ball /
+> Q-DTI sampling, motivated precisely by the limits of the single-tensor Gaussian
+> model. It also reports *low* entropy for isotropic CSF, whereas NDE is *highest*
+> for isotropic diffusion. NERVES is therefore **not** an implementation of that
+> estimator; the paper is cited as related work on entropy-based diffusion contrast.
+> Entropy-type scalar measures of the tensor itself have been discussed earlier
+> (e.g. Özarslan, Vemuri & Mareci 2005).
 
 ---
 
@@ -48,27 +50,28 @@ $$\text{NDE} = \frac{H}{\ln(3)} \in [0, 1]$$
 
 ## Sensitivity Analysis
 
-### Why NDE is sensitive to minor eigenvalue redistribution
+### The log-weighting argument (and its limits)
 
 The derivative of the entropy contribution function is:
 
 $$\frac{d}{dp}(-p \ln p) = -\ln(p) - 1$$
 
-| p value | Gradient magnitude |
+| p value | Gradient |
 |---|---|
 | 0.01 | +3.61 |
 | 0.10 | +1.30 |
-| 1/e ≈ 0.37 | 0.00 (minimum) |
+| 1/e ≈ 0.37 | 0.00 |
 | 0.90 | −0.89 |
 | 1.00 | −1.00 |
 
-The gradient diverges to +∞ as p → 0. This means **small changes in minor
-eigenvalue proportions produce large changes in NDE**, while the dominant
-eigenvalue (large p) contributes with a gradient near −1. FA's L2-norm
-weighting applies gradient magnitudes that are roughly symmetric across
-all eigenvalues.
+The gradient grows without bound as p → 0, so *for very small proportions* NDE changes
+rapidly with p. In diffusion tensors of brain tissue, however, the smallest proportion
+p₃ is rarely below ~0.1 (a λ₃ of ≥ 0.3×10⁻³ mm²/s against a trace of ~2.4), where the
+gradient is modest, and λ₃ is also the eigenvalue most affected by noise and by
+eigenvalue-sorting bias. The divergence at p → 0 should therefore **not** be read as
+evidence of practical sensitivity to subtle pathology.
 
-### Numerical demonstration (Manuscript Table 1)
+### Numerical illustration (Table 1)
 
 | Config | λ₁ | λ₂ | λ₃ | FA | NDE | Shape |
 |---|---|---|---|---|---|---|
@@ -79,25 +82,28 @@ all eigenvalues.
 
 Eigenvalues in units of ×10⁻³ mm²/s.
 
-Between Configs A and B: |ΔNDE| = 0.048, |ΔFA| = 0.040 — NDE shows a
-larger absolute difference on the shared [0,1] scale, demonstrating
-complementary sensitivity to minor-eigenvalue redistribution.
+These pairs differ in **both** FA and NDE, so they do not demonstrate contrast at fixed
+FA. Between A and B, |ΔNDE| = 0.048 > |ΔFA| = 0.040; between C and D,
+|ΔNDE| = 0.025 < |ΔFA| = 0.055. Absolute differences of two metrics are in any case
+not directly comparable, since the metrics have different dynamic ranges.
 
----
+### What NDE adds to FA (quantified)
 
-## Relationship to FA and Tensor Mode
+NDE depends on the eigenvalues only through their normalised shape, which has two
+degrees of freedom. FA and tensor mode (Ennis & Kindlmann 2006) are two orthogonal
+shape invariants, so together they determine NDE. For eigenvalues sampled over a
+white-matter-like range (`tests/test_complementarity.py`):
 
-NDE is strongly anticorrelated with FA globally (Pearson r typically −0.92
-to −0.98 in white matter), but **within narrow FA strata**, NDE spans a
-substantial range driven by the λ₂/λ₃ ratio.
+| Predictors of NDE | R² |
+|---|---|
+| FA alone | ≈ 0.98 |
+| FA and tensor mode | > 0.999 |
 
-This is the key complementarity: NDE and FA together provide a richer
-characterisation of the eigenvalue spectrum than either metric alone.
-
-NDE does not map onto tensor mode (Ennis & Kindlmann, 2006) in a simple
-way. Tensor mode distinguishes prolate (mode = +1) from oblate (mode = −1)
-configurations, while NDE is sensitive to the magnitude of the eigenvalue
-asymmetry regardless of its direction.
+At fixed FA, NDE does vary with the λ₂/λ₃ split, so it carries mode-like information
+beyond FA. That information is available directly from tensor mode, which has an
+established interpretation (prolate vs oblate). Any claim that NDE is more sensitive
+than FA (or mode) to a particular pathology needs empirical validation that this
+repository does not provide.
 
 ---
 
@@ -106,9 +112,13 @@ asymmetry regardless of its direction.
 | Condition | NDE value | Handling |
 |---|---|---|
 | λ₁ = λ₂ = λ₃ (isotropic) | 1.0 | Computed normally |
-| λ₁ >> λ₂ = λ₃ (prolate) | Lower, near 0.865 for typical WM | Computed normally |
-| Any λᵢ ≤ 0 | 0 (flagged) | Voxel written to QC flag mask |
-| Outside brain mask | 0 | Not computed |
+| λ₁ >> λ₂ = λ₃ (prolate) | Lower (e.g. 0.865 for λ = 1.5/0.5/0.5) | Computed normally |
+| Any λᵢ ≤ 0 | NaN (undefined) | Voxel written to QC flag mask; excluded from statistics and QC |
+| Outside brain mask | 0 | Not computed; excluded from statistics |
+
+NaN (rather than 0) is used for non-physical voxels because 0 is a legitimate NDE value
+meaning "maximally anisotropic", and voxels with λ₃ ≤ 0 are typically noisy,
+high-anisotropy voxels; writing 0 would bias summary statistics and QC.
 
 ---
 
@@ -116,7 +126,8 @@ asymmetry regardless of its direction.
 
 1. Fozouni N, Chopp M, Nejad-Davarani SP, et al. Characterizing brain
    structures and remodeling after TBI based on information content,
-   diffusion entropy. *PLoS One*. 2013;8(10):e76343.
+   diffusion entropy. *PLoS One*. 2013;8(10):e76343. (Related; model-free
+   estimator, not the one implemented here.)
 
 2. Özarslan E, Vemuri BC, Mareci TH. Generalized scalar measures for
    diffusion tensor imaging using trace, variance, and entropy.

@@ -27,17 +27,24 @@ three-element distribution, ln(3):
 NDE = 1  → perfectly isotropic  (λ₁ = λ₂ = λ₃)
 NDE = 0  → maximally anisotropic (all diffusion along one eigenvector)
 
-Key sensitivity property: the derivative d/dp(−p ln p) = −ln(p) − 1
-diverges to +∞ as p → 0, making NDE disproportionately sensitive to
-changes in the minor eigenvalue proportions (λ₂, λ₃) relative to the
-dominant eigenvalue (λ₁).  FA applies a quadratic (L2-norm) weighting
-that is symmetric across all eigenvalues.  NDE therefore carries
-complementary information to FA: two voxels can share identical FA but
-differ in NDE whenever the ratio λ₂/λ₃ differs.
+Relation to FA: NDE is a non-linear function of the same eigenvalues as
+FA.  At fixed FA it still varies with the λ₂/λ₃ split (i.e. with tensor
+mode), but in simulation FA alone explains ~98 % of its variance and
+FA + mode > 99.9 %.  Any added sensitivity to pathology is a hypothesis,
+not something this software demonstrates (see docs/theory.md).
 
-Reference: Fozouni N, Chopp M, Nejad-Davarani SP, et al. Characterizing
-brain structures and remodeling after TBI based on information content,
-diffusion entropy. PLoS One. 2013;8(10):e76343.
+Relation to prior work
+----------------------
+This is Shannon entropy of the *tensor eigenvalue spectrum* (a model-based,
+Gaussian-diffusion quantity). It is related in spirit to, but is not the same
+estimator as, the model-free (Q-ball / mean-free-path) diffusion entropy of:
+
+    Fozouni N, Chopp M, Nejad-Davarani SP, et al. Characterizing brain
+    structures and remodeling after TBI based on information content,
+    diffusion entropy. PLoS One. 2013;8(10):e76343.
+
+Because NDE is a function of the three eigenvalues only, it is (up to
+noise) a function of FA and tensor mode; see docs/theory.md.
 
 Pipeline overview
 -----------------
@@ -76,7 +83,7 @@ Usage
 
 Dependencies
 ------------
-Python  : numpy, nibabel, scipy, matplotlib, seaborn, pandas  (pip)
+Python  : numpy, nibabel, scipy, matplotlib  (pip)
 External: FSL ≥ 6.0, MRtrix3 ≥ 3.0.3, ANTs ≥ 2.3 (optional)
 """
 
@@ -85,7 +92,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -118,15 +125,19 @@ log = logging.getLogger("nde_pipeline")
 
 def run(cmd: str | list, cwd: Optional[Path] = None,
         check: bool = True) -> subprocess.CompletedProcess:
-    """Run a shell command, logging it, raising on failure."""
-    if isinstance(cmd, str):
-        cmd_str = cmd
-    else:
-        cmd_str = " ".join(str(c) for c in cmd)
+    """Run an external command (no shell), logging it, raising on failure.
+
+    ``cmd`` should be a list of arguments; each element is passed to the
+    program verbatim, so paths containing spaces or shell metacharacters
+    are safe. A plain string is tokenised with ``shlex.split`` for
+    convenience (quote paths yourself in that case). Shell pipelines are
+    deliberately unsupported -- write intermediate files instead, so a
+    failure in any stage is detected.
+    """
+    argv = shlex.split(cmd) if isinstance(cmd, str) else [str(c) for c in cmd]
+    cmd_str = " ".join(shlex.quote(a) for a in argv)
     log.info("CMD: %s", cmd_str)
-    result = subprocess.run(
-        cmd_str, shell=True, capture_output=True, text=True, cwd=cwd
-    )
+    result = subprocess.run(argv, capture_output=True, text=True, cwd=cwd)
     if result.stdout.strip():
         log.debug("STDOUT: %s", result.stdout.strip())
     if result.stderr.strip():
@@ -148,7 +159,7 @@ def validate_tools(use_ants: bool = False) -> None:
                     "fslmerge", "fslmaths"]
     required_mrtrix = ["dwidenoise", "mrdegibbs", "mrconvert",
                        "dwiextract", "mrmath"]
-    optional = ["topup", "applywarp"]
+    optional = ["topup", "applytopup", "applywarp"]
     ants = ["antsRegistrationSyNQuick.sh", "antsApplyTransforms"]
 
     missing = []
@@ -173,6 +184,16 @@ def validate_tools(use_ants: bool = False) -> None:
 # ===========================================================================
 # 2. DWI Preprocessing
 # ===========================================================================
+
+def _mean_b0(dwi_mif: Path, out_nii: Path, tmp_mif: Path) -> None:
+    """Mean of the b=0 volumes of ``dwi_mif`` -> ``out_nii``.
+
+    Uses an intermediate file instead of a shell pipe so that a failure in
+    ``dwiextract`` is not masked by a successful ``mrmath``.
+    """
+    run(["dwiextract", dwi_mif, "-bzero", tmp_mif, "-force"])
+    run(["mrmath", tmp_mif, "mean", out_nii, "-axis", "3", "-force"])
+
 
 def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
                    out_dir: Path, pe_dir: str = "AP",
@@ -199,33 +220,34 @@ def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
 
     # --- Convert input NIfTI → MIF for MRtrix3 ---
     dwi_mif = out_dir / "dwi_raw.mif"
-    run(f"mrconvert {dwi} -fslgrad {bvec} {bval} {dwi_mif} -force")
+    run(["mrconvert", dwi, "-fslgrad", bvec, bval, dwi_mif, "-force"])
 
     # --- 2a. MP-PCA denoising ---
     log.info("Step 2a: MP-PCA denoising")
     dwi_den = out_dir / "dwi_denoised.mif"
     noise_map = out_dir / "noise_map.nii.gz"
-    run(f"dwidenoise {dwi_mif} {dwi_den} -noise {noise_map} -force")
+    run(["dwidenoise", dwi_mif, dwi_den, "-noise", noise_map, "-force"])
 
     # --- 2b. Gibbs ringing removal ---
     log.info("Step 2b: Gibbs ringing removal")
     dwi_deg = out_dir / "dwi_degibbs.mif"
-    run(f"mrdegibbs {dwi_den} {dwi_deg} -force")
+    # NOTE: mrdegibbs assumes slices are acquired along the third image
+    # axis (axial acquisition); see docs/troubleshooting.md for -axes.
+    run(["mrdegibbs", dwi_den, dwi_deg, "-force"])
 
     # Convert degibbs output to NIfTI for FSL tools
     dwi_deg_nii = out_dir / "dwi_degibbs.nii.gz"
     bvecs_deg   = out_dir / "dwi_degibbs.bvec"
     bvals_deg   = out_dir / "dwi_degibbs.bval"
-    run(f"mrconvert {dwi_deg} {dwi_deg_nii} "
-        f"-export_grad_fsl {bvecs_deg} {bvals_deg} -force")
+    run(["mrconvert", dwi_deg, dwi_deg_nii,
+         "-export_grad_fsl", bvecs_deg, bvals_deg, "-force"])
 
     # --- 2c. Initial brain mask from mean b=0 ---
     log.info("Step 2c: Initial brain masking")
     mean_b0 = out_dir / "mean_b0.nii.gz"
-    run(f"dwiextract {dwi_deg} -bzero - | "
-        f"mrmath - mean {mean_b0} -axis 3 -force")
+    _mean_b0(dwi_deg, mean_b0, out_dir / "b0_vols_tmp.mif")
     mean_b0_brain = out_dir / "mean_b0_brain"
-    run(f"bet {mean_b0} {mean_b0_brain} -m -f 0.3")
+    run(["bet", mean_b0, mean_b0_brain, "-m", "-f", "0.3"])
     mask_init = out_dir / "mean_b0_brain_mask.nii.gz"
 
     # --- 2d. Topup (optional) ---
@@ -245,18 +267,30 @@ def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
         shutil.copy(rpe_b0, rpe_b0_nii)
 
         b0_pair = out_dir / "b0_pair.nii.gz"
-        run(f"fslmerge -t {b0_pair} {mean_b0} {rpe_b0_nii}")
+        run(["fslmerge", "-t", b0_pair, mean_b0, rpe_b0_nii])
 
         with open(acqparams, "w") as f:
             f.write(f"{pe_vec[0]} {pe_vec[1]} {pe_vec[2]} {readout_time}\n")
             f.write(f"{rpe_vec[0]} {rpe_vec[1]} {rpe_vec[2]} {readout_time}\n")
 
         topup_results = out_dir / "topup_results"
-        run(f"topup --imain={b0_pair} "
-            f"--datain={acqparams} "
-            f"--config=b02b0.cnf "
-            f"--out={topup_results} "
-            f"--fout={out_dir / 'field_map.nii.gz'}")
+        run(["topup", f"--imain={b0_pair}", f"--datain={acqparams}",
+             "--config=b02b0.cnf", f"--out={topup_results}",
+             f"--fout={out_dir / 'field_map.nii.gz'}"])
+
+        # The eddy brain mask must be defined on the *distortion-corrected*
+        # b0, otherwise it is misaligned with the data topup hands to eddy.
+        if check_tool("applytopup"):
+            mean_b0_corr = out_dir / "mean_b0_topup.nii.gz"
+            run(["applytopup", f"--imain={mean_b0}", f"--datain={acqparams}",
+                 "--inindex=1", f"--topup={topup_results}",
+                 f"--out={mean_b0_corr}", "--method=jac"])
+            mean_b0_brain = out_dir / "mean_b0_topup_brain"
+            run(["bet", mean_b0_corr, mean_b0_brain, "-m", "-f", "0.3"])
+            mask_init = out_dir / "mean_b0_topup_brain_mask.nii.gz"
+        else:
+            log.warning("applytopup not found; eddy mask is defined on the "
+                        "uncorrected b0.")
     else:
         if rpe_b0 is None:
             log.info("Step 2d: No reverse phase-encode b0 supplied; "
@@ -273,18 +307,14 @@ def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
         f.write(" ".join(["1"] * n_vols) + "\n")
 
     eddy_out = out_dir / "dwi_eddy"
-    eddy_cmd = (
-        f"eddy --imain={dwi_deg_nii} "
-        f"--mask={mask_init} "
-        f"--acqp={acqparams} "
-        f"--index={index_file} "
-        f"--bvecs={bvecs_deg} "
-        f"--bvals={bvals_deg} "
-        f"--repol "
-        f"--out={eddy_out}"
-    )
+    eddy_cmd = [
+        "eddy", f"--imain={dwi_deg_nii}", f"--mask={mask_init}",
+        f"--acqp={acqparams}", f"--index={index_file}",
+        f"--bvecs={bvecs_deg}", f"--bvals={bvals_deg}",
+        "--repol", f"--out={eddy_out}",
+    ]
     if topup_results is not None:
-        eddy_cmd += f" --topup={topup_results}"
+        eddy_cmd.append(f"--topup={topup_results}")
     run(eddy_cmd)
 
     eddy_nii    = Path(str(eddy_out) + ".nii.gz")
@@ -294,12 +324,11 @@ def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
     log.info("Step 2e (post): Final brain masking on eddy output")
     mean_b0_eddy = out_dir / "mean_b0_eddy.nii.gz"
     eddy_mif     = out_dir / "dwi_eddy.mif"
-    run(f"mrconvert {eddy_nii} -fslgrad {eddy_bvecs} {bvals_deg} "
-        f"{eddy_mif} -force")
-    run(f"dwiextract {eddy_mif} -bzero - | "
-        f"mrmath - mean {mean_b0_eddy} -axis 3 -force")
+    run(["mrconvert", eddy_nii, "-fslgrad", eddy_bvecs, bvals_deg,
+         eddy_mif, "-force"])
+    _mean_b0(eddy_mif, mean_b0_eddy, out_dir / "b0_vols_tmp.mif")
     mean_b0_final = out_dir / "mean_b0_final_brain"
-    run(f"bet {mean_b0_eddy} {mean_b0_final} -m -f 0.3")
+    run(["bet", mean_b0_eddy, mean_b0_final, "-m", "-f", "0.3"])
     mask_final = out_dir / "mean_b0_final_brain_mask.nii.gz"
 
     return {
@@ -315,7 +344,7 @@ def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
 # 3. T1 Preprocessing and Registration
 # ===========================================================================
 
-def preprocess_t1(t1: Path, dwi_ref: Path, mask_ref: Path,
+def preprocess_t1(t1: Path, dwi_ref: Path,
                   out_dir: Path, use_ants: bool = False) -> dict:
     """
     T1 brain extraction, tissue segmentation, and registration to DWI space.
@@ -328,14 +357,14 @@ def preprocess_t1(t1: Path, dwi_ref: Path, mask_ref: Path,
     # --- 3a. Brain extraction ---
     log.info("Step 3a: T1 brain extraction")
     t1_brain = out_dir / "T1_brain"
-    run(f"bet {t1} {t1_brain} -R -f 0.35 -g 0")
+    run(["bet", t1, t1_brain, "-R", "-f", "0.35", "-g", "0"])
     t1_brain_nii = Path(str(t1_brain) + ".nii.gz")
 
     # --- 3b. Tissue segmentation with FAST ---
     log.info("Step 3b: FSL FAST tissue segmentation (3-class)")
     fast_base = out_dir / "T1_fast"
-    run(f"fast -t 1 -n 3 -H 0.1 -I 4 -l 20.0 "
-        f"-o {fast_base} {t1_brain_nii}")
+    run(["fast", "-t", "1", "-n", "3", "-H", "0.1", "-I", "4", "-l", "20.0",
+         "-o", fast_base, t1_brain_nii])
     # FAST outputs: _pve_0 = CSF, _pve_1 = GM, _pve_2 = WM
     pve_csf = Path(str(fast_base) + "_pve_0.nii.gz")
     pve_gm  = Path(str(fast_base) + "_pve_1.nii.gz")
@@ -345,20 +374,23 @@ def preprocess_t1(t1: Path, dwi_ref: Path, mask_ref: Path,
     log.info("Step 3c: Registering T1 → DWI space")
 
     if use_ants and check_tool("antsRegistrationSyNQuick.sh"):
-        log.info("  Using ANTs SyN registration")
+        # '-t a' = rigid + affine only (no nonlinear SyN stage). Only the
+        # affine matrix is applied below, which is what is actually wanted
+        # for a within-subject T1 -> DWI alignment.
+        log.info("  Using ANTs rigid + affine registration")
         ants_prefix = out_dir / "T1_to_DWI_"
-        run(f"antsRegistrationSyNQuick.sh -d 3 "
-            f"-f {dwi_ref} -m {t1_brain_nii} "
-            f"-o {ants_prefix} -t a")
+        run(["antsRegistrationSyNQuick.sh", "-d", "3",
+             "-f", dwi_ref, "-m", t1_brain_nii,
+             "-o", ants_prefix, "-t", "a"])
 
         # Apply transform to PVE maps
         warped_pves = {}
         for name, pve in [("csf", pve_csf), ("gm", pve_gm), ("wm", pve_wm)]:
             out_pve = out_dir / f"T1_pve_{name}_DWIspace.nii.gz"
-            run(f"antsApplyTransforms -d 3 "
-                f"-i {pve} -r {dwi_ref} "
-                f"-t {ants_prefix}0GenericAffine.mat "
-                f"-n Linear -o {out_pve}")
+            run(["antsApplyTransforms", "-d", "3",
+                 "-i", pve, "-r", dwi_ref,
+                 "-t", f"{ants_prefix}0GenericAffine.mat",
+                 "-n", "Linear", "-o", out_pve])
             warped_pves[name] = out_pve
     else:
         if use_ants:
@@ -366,16 +398,16 @@ def preprocess_t1(t1: Path, dwi_ref: Path, mask_ref: Path,
         log.info("  Using FSL FLIRT affine registration")
         xfm = out_dir / "T1_to_DWI.mat"
         t1_in_dwi = out_dir / "T1_brain_DWIspace.nii.gz"
-        run(f"flirt -in {t1_brain_nii} -ref {dwi_ref} "
-            f"-out {t1_in_dwi} -omat {xfm} "
-            f"-dof 6 -cost normmi")
+        run(["flirt", "-in", t1_brain_nii, "-ref", dwi_ref,
+             "-out", t1_in_dwi, "-omat", xfm,
+             "-dof", "6", "-cost", "normmi"])
 
         warped_pves = {}
         for name, pve in [("csf", pve_csf), ("gm", pve_gm), ("wm", pve_wm)]:
             out_pve = out_dir / f"T1_pve_{name}_DWIspace.nii.gz"
-            run(f"flirt -in {pve} -ref {dwi_ref} "
-                f"-applyxfm -init {xfm} "
-                f"-out {out_pve} -interp trilinear")
+            run(["flirt", "-in", pve, "-ref", dwi_ref,
+                 "-applyxfm", "-init", xfm,
+                 "-out", out_pve, "-interp", "trilinear"])
             warped_pves[name] = out_pve
 
     return {
@@ -402,13 +434,8 @@ def estimate_tensor(dwi: Path, bvecs: Path, bvals: Path,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     dti_prefix = out_dir / "dti"
-    run(f"dtifit "
-        f"-k {dwi} "
-        f"-m {mask} "
-        f"-r {bvecs} "
-        f"-b {bvals} "
-        f"-o {dti_prefix} "
-        f"--save_tensor")
+    run(["dtifit", "-k", dwi, "-m", mask, "-r", bvecs, "-b", bvals,
+         "-o", dti_prefix, "--save_tensor"])
 
     l1 = out_dir / "dti_L1.nii.gz"
     l2 = out_dir / "dti_L2.nii.gz"
@@ -419,7 +446,7 @@ def estimate_tensor(dwi: Path, bvecs: Path, bvals: Path,
 
     # Compute RD = (L2 + L3) / 2 if not already written
     if not rd.exists():
-        run(f"fslmaths {l2} -add {l3} -div 2 {rd}")
+        run(["fslmaths", l2, "-add", l3, "-div", "2", rd])
 
     # Verify eigenvalue ordering: L1 should exceed L2 everywhere in mask
     l1_data = nib.load(str(l1)).get_fdata()
@@ -448,17 +475,19 @@ def compute_nde(l1_path: Path, l2_path: Path, l3_path: Path,
 
     NDE = −Σ pᵢ ln(pᵢ) / ln(3),  pᵢ = λᵢ / Σλⱼ
 
-    Sensitivity property: the derivative d/dp(−p ln p) = −ln(p) − 1
-    diverges to +∞ as p → 0, so NDE responds disproportionately to
-    changes in the minor eigenvalues.  This gives complementary (not
-    redundant) information relative to FA's quadratic (L2-norm) weighting.
+    NDE depends only on the normalised eigenvalue shape, so it is a
+    function of FA and tensor mode (see docs/theory.md).
 
     Edge-case handling
     ------------------
-    - Any λᵢ ≤ 0  → voxel flagged in QC mask, NDE = 0
+    - Any λᵢ ≤ 0  → voxel flagged in the QC mask and NDE = NaN (undefined).
+                    NaN -- not 0 -- because 0 is a valid NDE meaning
+                    "maximally anisotropic", and such voxels are typically
+                    the noisy, high-anisotropy ones. They are excluded from
+                    all summary statistics and QC.
     - pᵢ = 0      → 0 · ln(0) defined as 0 (L'Hôpital / continuity)
     - All λᵢ equal → NDE = 1 (maximum entropy, perfectly isotropic)
-    - Outside mask → NDE = 0 (not computed)
+    - Outside mask → NDE = 0 (not computed; excluded from statistics)
     """
     log.info("=== NDE Computation ===")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -479,6 +508,7 @@ def compute_nde(l1_path: Path, l2_path: Path, l3_path: Path,
     non_phys = mask & ~valid           # inside mask but non-positive eigs
 
     qc_flag[non_phys] = 1
+    nde_vol[non_phys] = np.nan         # undefined, not "0 = fully anisotropic"
 
     # Stack eigenvalues for vectorised computation: shape (N_valid, 3)
     eigs = np.stack([l1[valid], l2[valid], l3[valid]], axis=-1)
@@ -499,24 +529,26 @@ def compute_nde(l1_path: Path, l2_path: Path, l3_path: Path,
 
     # Save NDE map
     nde_path = out_dir / "nde.nii.gz"
-    nib.save(
-        nib.Nifti1Image(nde_vol, l1_img.affine, l1_img.header),
-        str(nde_path)
-    )
+    nde_hdr = l1_img.header.copy()
+    nde_hdr.set_data_dtype(np.float32)
+    nib.save(nib.Nifti1Image(nde_vol, l1_img.affine, nde_hdr), str(nde_path))
 
     # Save QC flag mask
     qc_path = out_dir / "nde_qc_flag.nii.gz"
-    nib.save(
-        nib.Nifti1Image(qc_flag, l1_img.affine, l1_img.header),
-        str(qc_path)
-    )
+    flag_hdr = l1_img.header.copy()
+    flag_hdr.set_data_dtype(np.uint8)
+    nib.save(nib.Nifti1Image(qc_flag, l1_img.affine, flag_hdr), str(qc_path))
 
-    # Summary statistics (brain mask)
-    nde_brain = nde_vol[mask]
+    # Summary statistics over VALID voxels only (flagged voxels are NaN)
+    nde_brain = nde_vol[valid]
     n_mask    = int(mask.sum())
     n_valid   = int(valid.sum())
     n_nonphys = int(non_phys.sum())
     nonphys_pct = 100.0 * n_nonphys / n_mask if n_mask > 0 else 0.0
+
+    if nde_brain.size == 0:
+        raise RuntimeError("No valid (all eigenvalues > 0) voxels inside the "
+                           "mask; cannot compute NDE statistics.")
 
     stats = {
         "n_mask_voxels":      n_mask,
@@ -532,7 +564,7 @@ def compute_nde(l1_path: Path, l2_path: Path, l3_path: Path,
         "nde_p95":            float(np.percentile(nde_brain, 95)),
     }
 
-    log.info("NDE summary (brain mask):")
+    log.info("NDE summary (valid voxels in brain mask):")
     log.info("  Voxels in mask:        %d", n_mask)
     log.info("  Valid (computed):      %d", n_valid)
     log.info("  Non-physical flagged:  %d  (%.2f%%)", n_nonphys, nonphys_pct)
@@ -563,8 +595,11 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
       - Tissue-specific NDE distributions (if PVE maps provided)
       - NDE vs FA scatter plot
       - Axial slice montage (NDE, FA, MD side-by-side)
-      - Metric correlation matrix
-      - Pastes pass/fail on QC thresholds
+      - Sanity checks: CSF NDE high; tissue ordering CSF > GM > WM.
+        The NDE-FA correlation is reported for information only: NDE and
+        FA are both deterministic functions of the same eigenvalues, so a
+        strong anticorrelation is expected even for badly corrupted
+        tensors and cannot serve as a pass/fail quality criterion.
     """
     log.info("=== Quality Control ===")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -577,6 +612,10 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
     l1    = nib.load(str(l1_path)).get_fdata()
     l2    = nib.load(str(l2_path)).get_fdata()
     l3    = nib.load(str(l3_path)).get_fdata()
+
+    # Only voxels with a defined NDE take part in QC (flagged voxels are NaN)
+    valid_nde = np.isfinite(nde)
+    mask = mask & valid_nde
 
     # WM mask: use PVE if available, otherwise FA > 0.2 heuristic
     if pve_wm is not None:
@@ -664,8 +703,11 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
         plt.close(fig)
         log.info("Saved: qc_tissue_distributions.png")
 
-        # QC threshold checks
+        # Sanity checks. Absolute WM NDE depends on acquisition (b-value,
+        # SNR, resolution) and on how WM is defined, so it is reported but
+        # not thresholded; the *relative* tissue ordering is checked instead.
         csf_vals = nde[tissue_masks["CSF"]]
+        gm_vals  = nde[tissue_masks["Gray matter"]]
         wm_vals  = nde[tissue_masks["White matter"]]
         if len(csf_vals) > 50:
             csf_mean = float(csf_vals.mean())
@@ -674,13 +716,23 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
             if not qc_results["csf_nde_pass"]:
                 log.warning("QC FAIL: Mean NDE in CSF = %.3f (expected ≥ 0.90)",
                             csf_mean)
+        if len(gm_vals) > 50:
+            qc_results["gm_nde_mean"] = float(gm_vals.mean())
         if len(wm_vals) > 50:
-            wm_mean = float(wm_vals.mean())
-            qc_results["wm_nde_mean"] = wm_mean
-            qc_results["wm_nde_pass"] = bool(wm_mean < 0.85)
-            if not qc_results["wm_nde_pass"]:
-                log.warning("QC WARN: Mean NDE in WM = %.3f (expected < 0.85)."
-                            " Check preprocessing quality.", wm_mean)
+            qc_results["wm_nde_mean"] = float(wm_vals.mean())
+        if all(k in qc_results for k in ("csf_nde_mean", "gm_nde_mean",
+                                          "wm_nde_mean")):
+            order_ok = bool(qc_results["csf_nde_mean"]
+                            > qc_results["gm_nde_mean"]
+                            > qc_results["wm_nde_mean"])
+            qc_results["tissue_ordering_pass"] = order_ok
+            if not order_ok:
+                log.warning("QC WARN: expected mean NDE CSF > GM > WM, got "
+                            "%.3f / %.3f / %.3f. Check registration, "
+                            "segmentation and tensor fit.",
+                            qc_results["csf_nde_mean"],
+                            qc_results["gm_nde_mean"],
+                            qc_results["wm_nde_mean"])
 
     # ------------------------------------------------------------------
     # Figure 3: NDE vs FA scatter (random subsample within WM)
@@ -693,8 +745,7 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
     idx = rng.choice(len(nde_wm), size=n_sample, replace=False)
 
     r, pval = pearsonr(fa_wm[idx], nde_wm[idx])
-    qc_results["nde_fa_pearson_r"] = float(r)
-    qc_results["nde_fa_anticorrelated"] = bool(r < -0.80)
+    qc_results["nde_fa_pearson_r"] = float(r)   # informational only
 
     fig, ax = plt.subplots(figsize=(8, 7))
     ax.scatter(fa_wm[idx], nde_wm[idx], s=1, alpha=0.15,
@@ -702,13 +753,13 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
     ax.set_xlabel("FA", fontsize=13)
     ax.set_ylabel("NDE", fontsize=13)
     ax.set_title(f"NDE vs FA (white matter, n={n_sample:,})\n"
-                 f"Pearson r = {r:.3f}  [expected −0.95 to −0.98]",
+                 f"Pearson r = {r:.3f}  (informational)",
                  fontsize=13)
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     # Annotate expected complementarity zone (intermediate FA)
     ax.axvspan(0.3, 0.6, alpha=0.07, color="yellow",
-               label="Max dissociation zone (FA 0.3–0.6)")
+               label="Intermediate FA (0.3–0.6)")
     ax.legend(fontsize=10)
     fig.tight_layout()
     fig.savefig(out_dir / "qc_nde_fa_scatter.png", dpi=200,
@@ -808,14 +859,20 @@ def write_report(out_dir: Path, nde_stats: dict, qc_results: dict,
         "qc_thresholds": {
             "nonphysical_eigenvalue_pct_max": 5.0,
             "csf_nde_mean_min": 0.90,
-            "wm_nde_mean_max":  0.85,
-            "nde_fa_r_max":     -0.80,
+            "tissue_ordering":  "CSF > GM > WM (mean NDE)",
         },
+        "notes": (
+            "NDE here is the normalised Shannon entropy of the diffusion "
+            "tensor eigenvalue spectrum. It is NOT the model-free (Q-ball) "
+            "diffusion entropy of Fozouni et al. 2013, which is cited for "
+            "the general idea of entropy-based diffusion contrast. NDE-FA "
+            "correlation is informational, not a quality criterion."
+        ),
         "reference": (
             "Fozouni N, Chopp M, Nejad-Davarani SP, Zhang ZG, Lehman NL, "
             "Gu S, et al. Characterizing brain structures and remodeling "
             "after TBI based on information content, diffusion entropy. "
-            "PLoS One. 2013;8(10):e76343."
+            "PLoS One. 2013;8(10):e76343 (related; different estimator)."
         ),
     }
     rpt_path = out_dir / "nde_pipeline_report.json"
@@ -863,7 +920,8 @@ def parse_args() -> argparse.Namespace:
                         "placeholder, not a measured value; set this "
                         "explicitly for real data. (default: %(default)s)")
     p.add_argument("--use_ants", action="store_true",
-                   help="Use ANTs SyN for T1→DWI registration (default: FLIRT)")
+                   help="Use ANTs rigid+affine for T1→DWI registration "
+                        "(default: FLIRT 6-DOF)")
 
     # --- Skip preprocessing (use pre-computed eigenvalues) ---
     p.add_argument("--skip_preproc", action="store_true",
@@ -898,6 +956,25 @@ def parse_args() -> argparse.Namespace:
                    help="Enable DEBUG logging")
 
     return p.parse_args()
+
+
+def _validate_shapes(named_paths: dict) -> None:
+    """Exit with an error if supplied NIfTI inputs differ in grid shape."""
+    shapes = {}
+    for name, path in named_paths.items():
+        if path is None:
+            continue
+        if not Path(path).exists():
+            log.error("%s: file not found: %s", name, path)
+            sys.exit(1)
+        shapes[name] = tuple(nib.load(str(path)).shape)
+    ref_name = next(iter(shapes))
+    for name, shp in shapes.items():
+        if shp != shapes[ref_name]:
+            log.error("Shape mismatch: %s is %s but %s is %s. All inputs "
+                      "must be on the same voxel grid.",
+                      name, shp, ref_name, shapes[ref_name])
+            sys.exit(1)
 
 
 def main() -> None:
@@ -953,7 +1030,6 @@ def main() -> None:
         t1_results = preprocess_t1(
             t1=args.t1,
             dwi_ref=preproc["mean_b0"],
-            mask_ref=mask_path,
             out_dir=out_dir / "t1",
             use_ants=args.use_ants,
         )
@@ -987,6 +1063,11 @@ def main() -> None:
         if missing:
             log.error("--skip_preproc requires: %s", ", ".join(missing))
             sys.exit(1)
+        _validate_shapes({"--l1": l1_path, "--l2": l2_path,
+                          "--l3": l3_path, "--mask": mask_path,
+                          "--fa": args.fa, "--md": args.md,
+                          "--pve_csf": pve_csf, "--pve_gm": pve_gm,
+                          "--pve_wm": pve_wm})
         # Derive FA / MD paths if they exist alongside the eigenvalues
         # (assume dtifit naming convention: ..._L1.nii.gz -> ..._FA.nii.gz).
         # --fa/--md, if given, always take priority over auto-detection.
@@ -1073,7 +1154,7 @@ def main() -> None:
     # Non-zero exit code if non-physical rate is too high
     if nde_result["stats"]["nonphysical_pct"] > 5.0:
         log.warning("Exiting with code 2: non-physical eigenvalue rate "
-                    "exceeds 5%%. Review preprocessing.")
+                    "exceeds 5%. Review preprocessing.")
         sys.exit(2)
 
 

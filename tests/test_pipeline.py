@@ -137,10 +137,39 @@ class TestComputeNdeReal:
         )
         nde_vol = nib.load(str(result["nde"])).get_fdata()
         qc_vol = nib.load(str(result["qc_flag"])).get_fdata()
-        assert nde_vol[1, 0, 0] == 0.0
+        assert np.isnan(nde_vol[1, 0, 0])   # undefined, NOT 0 (=fully anisotropic)
         assert qc_vol[1, 0, 0] == 1.0
         assert qc_vol[0, 0, 0] == 0.0
         assert result["stats"]["n_nonphysical"] == 1
+
+    def test_flagged_voxels_excluded_from_stats(self, tmp_path):
+        """Non-physical voxels must not drag summary statistics toward 0."""
+        shape = (3, 1, 1)
+        l1 = np.array([[[1.2]], [[1.2]], [[-0.1]]])   # voxel 2 non-physical
+        l2 = np.full(shape, 0.6)
+        l3 = np.full(shape, 0.4)
+        mask = np.ones(shape, dtype=np.float32)
+        for name, arr in [("l1", l1), ("l2", l2), ("l3", l3), ("mask", mask)]:
+            _save_nii(tmp_path / f"{name}.nii.gz", arr)
+        result = compute_nde(
+            tmp_path / "l1.nii.gz", tmp_path / "l2.nii.gz", tmp_path / "l3.nii.gz",
+            tmp_path / "mask.nii.gz", tmp_path / "out",
+        )
+        st = result["stats"]
+        assert st["n_valid_voxels"] == 2 and st["n_nonphysical"] == 1
+        assert st["nde_min"] > 0.5            # would be 0.0 if flagged voxel leaked in
+        assert abs(st["nde_mean"] - st["nde_max"]) < 1e-6
+
+    def test_all_invalid_raises(self, tmp_path):
+        shape = (2, 1, 1)
+        for name, arr in [("l1", np.full(shape, -1.0)), ("l2", np.full(shape, 0.5)),
+                          ("l3", np.full(shape, 0.5)), ("mask", np.ones(shape))]:
+            _save_nii(tmp_path / f"{name}.nii.gz", arr)
+        with pytest.raises(RuntimeError, match="No valid"):
+            compute_nde(
+                tmp_path / "l1.nii.gz", tmp_path / "l2.nii.gz",
+                tmp_path / "l3.nii.gz", tmp_path / "mask.nii.gz", tmp_path / "out",
+            )
 
     def test_stats_dict_keys(self, tmp_path):
         shape = (3, 1, 1)
@@ -184,6 +213,32 @@ class TestWriteReport:
         assert "qc_thresholds" in report
         assert report["qc_thresholds"]["csf_nde_mean_min"] == 0.90
         assert "reference" in report and "Fozouni" in report["reference"]
+        assert "nde_fa_r_max" not in report["qc_thresholds"]   # r is informational
+        assert "notes" in report
+
+
+# ---------------------------------------------------------------------------
+# run(): no shell, safe with awkward paths
+# ---------------------------------------------------------------------------
+
+class TestRun:
+
+    def test_arguments_passed_verbatim(self, tmp_path):
+        """Spaces and shell metacharacters must not be interpreted."""
+        marker = tmp_path / "pwned"
+        tricky = f"a b; touch {marker} #"
+        res = nde_pipeline.run(
+            [sys.executable, "-c", "import sys; print(sys.argv[1])", tricky])
+        assert res.stdout.strip() == tricky
+        assert not marker.exists()
+
+    def test_failure_raises(self):
+        with pytest.raises(RuntimeError):
+            nde_pipeline.run([sys.executable, "-c", "raise SystemExit(3)"])
+
+    def test_no_shell_pipelines_in_source(self):
+        src = PIPELINE_SCRIPT.read_text()
+        assert "shell=True" not in src
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +402,48 @@ class TestSkipPreprocEndToEnd:
         assert (qc_dir / "qc_axial_montage.png").exists()
         assert (qc_dir / "qc_tissue_distributions.png").exists()
 
+    def test_shape_mismatch_exits_1(self, tmp_path):
+        shape = (4, 4, 3)
+        in_dir = tmp_path / "in"
+        in_dir.mkdir()
+        for name, shp in [("eig1", shape), ("eig2", shape), ("eig3", (5, 4, 3)),
+                          ("brainmask", shape)]:
+            _save_nii(in_dir / f"{name}.nii.gz", np.ones(shp))
+        result = subprocess.run(
+            [sys.executable, str(PIPELINE_SCRIPT), "--skip_preproc",
+             "--l1", str(in_dir / "eig1.nii.gz"), "--l2", str(in_dir / "eig2.nii.gz"),
+             "--l3", str(in_dir / "eig3.nii.gz"), "--mask", str(in_dir / "brainmask.nii.gz"),
+             "--dwi", "x", "--bval", "x", "--bvec", "x", "--t1", "x",
+             "--out", str(tmp_path / "o")],
+            capture_output=True, text=True)
+        assert result.returncode == 1
+        assert "Shape mismatch" in result.stderr
+
+    def test_qc_flagged_voxels_do_not_affect_report(self, tmp_path):
+        """A flagged voxel must yield NaN in the map and no NaN in the JSON."""
+        inputs = _make_skip_preproc_inputs(tmp_path)
+        l1 = nib.load(str(inputs["dti_L1"])).get_fdata().astype(np.float32)
+        mask = nib.load(str(inputs["mask"])).get_fdata() > 0
+        idx = tuple(np.argwhere(mask)[0])
+        l1[idx] = -0.5
+        _save_nii(inputs["dti_L1"], l1)
+        out_dir = tmp_path / "flagged_out"
+        result = subprocess.run(
+            [sys.executable, str(PIPELINE_SCRIPT), "--skip_preproc",
+             "--l1", str(inputs["dti_L1"]), "--l2", str(inputs["dti_L2"]),
+             "--l3", str(inputs["dti_L3"]), "--mask", str(inputs["mask"]),
+             "--pve_csf", str(inputs["pve_csf"]), "--pve_gm", str(inputs["pve_gm"]),
+             "--pve_wm", str(inputs["pve_wm"]),
+             "--dwi", "x", "--bval", "x", "--bvec", "x", "--t1", "x",
+             "--out", str(out_dir)],
+            capture_output=True, text=True)
+        # 1 flagged voxel in a tiny mask exceeds 5% -> documented exit code 2
+        assert result.returncode == 2, result.stderr
+        rpt = json.loads((out_dir / "nde_pipeline_report.json").read_text())
+        assert rpt["nde_statistics"]["n_nonphysical"] == 1
+        assert np.isfinite(rpt["qc_results"]["nde_fa_pearson_r"])
+        assert "nde_fa_anticorrelated" not in rpt["qc_results"]
+
     def test_fa_md_not_found_skips_qc_gracefully(self, tmp_path):
         """If FA/MD aren't alongside L1 (non-dtifit naming), the pipeline
         should still complete and just skip QC figures, not crash — and
@@ -416,3 +513,53 @@ class TestSkipPreprocEndToEnd:
         assert result.returncode == 0, result.stderr
         assert (out_dir / "qc" / "qc_histograms.png").exists()
         assert (out_dir / "qc" / "qc_nde_fa_scatter.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# Command construction (no FSL/MRtrix needed: run() is captured)
+# ---------------------------------------------------------------------------
+
+class TestCommandConstruction:
+
+    def _capture(self, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, cwd=None, check=True):
+            calls.append(cmd)
+
+            class _R:
+                returncode = 0
+                stdout = stderr = ""
+            return _R()
+
+        monkeypatch.setattr(nde_pipeline, "run", fake_run)
+        return calls
+
+    def test_dwi_commands_are_lists_with_spaces_preserved(self, tmp_path, monkeypatch):
+        calls = self._capture(monkeypatch)
+        monkeypatch.setattr(nde_pipeline, "check_tool", lambda n: True)
+        out_dir = tmp_path / "out dir with spaces"
+        out_dir.mkdir()
+        _save_nii(out_dir / "dwi_degibbs.nii.gz", np.zeros((4, 4, 4, 3)))
+        rpe = tmp_path / "rpe b0.nii.gz"
+        _save_nii(rpe, np.zeros((4, 4, 4)))
+        nde_pipeline.preprocess_dwi(
+            dwi=tmp_path / "my dwi.nii.gz", bval=tmp_path / "a.bval",
+            bvec=tmp_path / "a.bvec", out_dir=out_dir, rpe_b0=rpe)
+        assert all(isinstance(c, list) for c in calls)
+        flat = [str(a) for c in calls for a in c]
+        assert str(tmp_path / "my dwi.nii.gz") in flat      # one argv element
+        assert not any(a == "|" for a in flat)               # no shell pipes
+        names = [c[0] for c in calls]
+        assert "applytopup" in names                         # mask from corrected b0
+        assert names.index("applytopup") < names.index("eddy")
+        eddy = next(c for c in calls if c[0] == "eddy")
+        assert any(a.startswith("--topup=") for a in eddy)
+
+    def test_ants_uses_affine_only_and_is_labelled_so(self, tmp_path, monkeypatch):
+        calls = self._capture(monkeypatch)
+        monkeypatch.setattr(nde_pipeline, "check_tool", lambda n: True)
+        nde_pipeline.preprocess_t1(tmp_path / "t1.nii.gz", tmp_path / "ref.nii.gz",
+                                   tmp_path / "t1out", use_ants=True)
+        reg = next(c for c in calls if c[0] == "antsRegistrationSyNQuick.sh")
+        assert reg[reg.index("-t") + 1] == "a"

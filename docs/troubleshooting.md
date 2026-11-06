@@ -31,6 +31,15 @@
 
 ## Tensor Estimation Issues
 
+### Gibbs ringing correction on non-axial acquisitions
+`mrdegibbs` assumes slices lie along the third image axis. For sagittal/coronal
+acquisitions, edit the call in `preprocess_dwi` to add `-axes` for the in-plane axes
+(see `mrdegibbs -help`).
+
+### Paths containing spaces
+All external commands are executed without a shell, so spaces and special characters
+in paths are safe.
+
 ### High non-physical eigenvalue rate (> 5%)
 Non-physical (negative) eigenvalues arise when tensor fitting is
 ill-conditioned. Common causes:

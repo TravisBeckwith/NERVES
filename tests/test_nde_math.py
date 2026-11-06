@@ -106,14 +106,22 @@ class TestManuscriptTable1:
         assert abs(got - expected) < 0.001, \
             f"Config {name}: expected {expected:.4f}, got {got:.4f}"
 
-    def test_ab_absolute_difference(self):
-        """Corrected manuscript: |ΔNDE| > |ΔFA| between Configs A and B."""
-        nde_A = nde_scalar(1.5, 0.50, 0.50)
-        nde_B = nde_scalar(1.5, 0.75, 0.25)
-        fa_A  = fa_scalar(1.5, 0.50, 0.50)
-        fa_B  = fa_scalar(1.5, 0.75, 0.25)
-        assert abs(nde_A - nde_B) > abs(fa_A - fa_B), \
-            "NDE absolute difference should exceed FA absolute difference"
+    def test_ab_and_cd_pairs_are_not_equal_fa(self):
+        """Table 1 pairs differ in FA as well as NDE, so they do not by
+        themselves demonstrate NDE contrast at *fixed* FA (see
+        tests/test_complementarity.py for a matched-FA test). Note also
+        that |dNDE| > |dFA| holds for A-B but not for C-D.
+        """
+        fa = {k: fa_scalar(*v) for k, v in dict(
+            A=(1.5, .5, .5), B=(1.5, .75, .25),
+            C=(1.2, .6, .6), D=(1.2, .8, .4)).items()}
+        nde = {k: nde_scalar(*v) for k, v in dict(
+            A=(1.5, .5, .5), B=(1.5, .75, .25),
+            C=(1.2, .6, .6), D=(1.2, .8, .4)).items()}
+        assert abs(fa["A"] - fa["B"]) > 0.01
+        assert abs(fa["C"] - fa["D"]) > 0.01
+        assert abs(nde["A"] - nde["B"]) > abs(fa["A"] - fa["B"])
+        assert abs(nde["C"] - nde["D"]) < abs(fa["C"] - fa["D"])
 
     def test_prolate_higher_nde_than_asymmetric(self):
         """Prolate configs (equal minor eigenvalues) have higher NDE."""

@@ -102,8 +102,6 @@ pip install -r requirements.txt
 | nibabel | 3.2.0 | NIfTI file I/O |
 | scipy | 1.7.0 | Statistical functions, KDE |
 | matplotlib | 3.4.0 | QC figure generation |
-| seaborn | 0.11.0 | Plot styling |
-| pandas | 1.3.0 | Report tabulation |
 
 ---
 
