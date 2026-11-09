@@ -121,7 +121,7 @@ from scipy.stats import gaussian_kde, pearsonr
 
 import nerves_dti
 
-__version__ = "1.1.0-dev"
+__version__ = "2.0.0-dev"
 
 # ---------------------------------------------------------------------------
 # Logging

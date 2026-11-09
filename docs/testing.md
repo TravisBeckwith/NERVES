@@ -7,7 +7,7 @@ pip install -r requirements.txt pytest
 python -m pytest -m "not integration" -q        # no FSL / MRtrix3 required
 ```
 
-The default suite (≈ 95 tests) covers:
+The default suite (≈ 124 tests) covers:
 
 * NDE maths and edge cases, including NaN handling and scale invariance
 * gradient-table validation, shell selection, native tensor fitting (OLS/WLS)
@@ -16,7 +16,11 @@ The default suite (≈ 95 tests) covers:
   (`--skip_dwi_preproc --tensor_fit python`), including recovery of WM NDE
 * the exact external commands built for denoise/de-Gibbs/topup/eddy/dtifit/epi_reg
   (captured, not executed), including `--resume`, threading and BIDS PE codes
-* the BIDS runner, group summary, noise simulation and reliability tools
+* the BIDS runner, group summary and noise simulation
+* `nerves_reliability.py` (monotonicity in SNR/directions, known upward low-SNR FA bias,
+  mode unreliability in low-FA tissue) and `nerves_qc.py` (QSIRecon and FSL layouts,
+  unit detection, corrupted/empty/inconsistent maps, outlier flagging, exit codes, and
+  a run on real pipeline output from the phantom)
 
 ## What the unit tests cannot cover
 

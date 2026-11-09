@@ -319,7 +319,7 @@ class TestBidsAndSummary:
                 "timestamp": "t", "run_mode": "full",
                 "nde_statistics": {"nde_mean": v, "n_mask_voxels": 10},
                 "qc_results": {"csf_nde_pass": True},
-                "snr": {"snr_median": 25.0}, "versions": {"nerves": "1.1.0-dev"}}))
+                "snr": {"snr_median": 25.0}, "versions": {"nerves": "2.0.0-dev"}}))
         rows = gs.collect(tmp_path)
         assert [r["run"] for r in rows] == ["a", "b"]
         out = gs.write_csv(rows, tmp_path / "g.csv")
