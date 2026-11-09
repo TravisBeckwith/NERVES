@@ -114,8 +114,13 @@ The JSON report records the sanity-check results. Key fields:
 ```
 
 (Values are illustrative.) `nde_statistics` are computed over **valid** voxels only;
-voxels with a non-positive eigenvalue are NaN in the map and excluded. The WM mean and
-the NDE–FA r are informational.
+voxels with a non-positive eigenvalue, or with SNR below `--min_snr`, are NaN in the map
+and excluded (`nde_qc_flag.nii.gz`: 1 = non-physical, 2 = low SNR; counts in
+`n_nonphysical` / `n_low_snr`). The WM mean, `nde_fa_pearson_r` and
+`nde_variance_explained_by_fa` (= r²) are informational; the latter shows how much of
+NDE is simply FA. In full mode the report also records `snr` (median and 5th/95th
+percentile b=0 SNR), `shape_statistics` (mode and Westin means), the acquisition's
+b-value shells, and software `versions`.
 
 A run passes the automated screens when `csf_nde_pass` and `tissue_ordering_pass` are
 `true` and `nonphysical_pct` is below 5%. This is a necessary, not sufficient, condition

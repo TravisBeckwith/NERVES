@@ -36,6 +36,23 @@
 acquisitions, edit the call in `preprocess_dwi` to add `-axes` for the in-plane axes
 (see `mrdegibbs -help`).
 
+### Re-running after a failure
+Use `--resume`: finished stages (denoise, de-Gibbs, topup, eddy, masks, T1 steps, tensor fit)
+are skipped if their outputs exist. Delete a stage's outputs to force it to rerun, e.g.
+remove `preproc/dwi_eddy.nii.gz` to rerun eddy and everything after it.
+
+### "Missing required tools: eddy"
+NERVES looks for `eddy_cpu`, `eddy_openmp` and `eddy` (and CUDA builds with `--eddy_gpu`).
+FSL 6.0.4+ ships `eddy_cpu`; check `which eddy_cpu`.
+
+### Highest b-value warning / multi-shell data
+DTI assumes Gaussian diffusion. Above roughly b = 1000–1500 s/mm² kurtosis biases the tensor
+and therefore NDE, FA and MD. Use `--max_b 1000` (or 1500) to fit only the lower shell.
+
+### Many negative eigenvalues / NDE lower than expected at low SNR
+Use `--wls`, check `preproc/snr_map.nii.gz`, and consider `--min_snr` to mask low-SNR voxels.
+NDE is biased low at low SNR.
+
 ### Paths containing spaces
 All external commands are executed without a shell, so spaces and special characters
 in paths are safe.

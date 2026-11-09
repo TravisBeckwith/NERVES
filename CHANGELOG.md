@@ -8,6 +8,37 @@ NERVES uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (v1.1.0-dev)
+- **Companion shape maps** written by default: tensor mode and Westin cl/cp/cs
+  (`shape/`), defined on the same voxels as NDE (`--nde_only` disables). Motivated by
+  the new simulation showing mode is far more sensitive than NDE to λ₂/λ₃ changes.
+- **Native NumPy tensor fit** (`--tensor_fit python`, OLS or `--wls`) in the new
+  `nerves_dti.py`; `--wls` also maps to `dtifit -w`. In simulation WLS cuts
+  negative-eigenvalue voxels 2–5× and reduces NDE variance and bias at low SNR.
+- **Input validation** of the gradient table (length, b=0, directions, unit vectors),
+  b-value range / multi-shell warnings and `--max_b` single-shell selection.
+- **SNR map** from the `dwidenoise` noise sigma, `--min_snr` masking (QC flag 2),
+  `--snr` for external maps, SNR statistics in the report.
+- **`--skip_dwi_preproc`** entry point for already-preprocessed DWI; `--dwi/--bval/
+  --bvec/--t1` are now optional where not needed.
+- **Eddy executable detection** (`eddy_cpu`, `eddy_openmp`, `eddy`, CUDA with
+  `--eddy_gpu`), `--n_threads`, `--resume`, `--registration {flirt,epi_reg,ants}`,
+  BIDS phase-encode codes for `--pe_dir`, `--version`.
+- Reproducibility: software versions (NERVES, Python libs, FSL, MRtrix3, git commit),
+  run mode and acquisition summary are recorded in the report.
+- `nerves_bids.py` (run a BIDS dataset) and `nerves_group_summary.py` (reports → CSV).
+- `validation/` tools: Monte-Carlo noise simulation, synthetic phantom, test-retest
+  ICC; `docs/testing.md`.
+- ~50 new tests, including a full CLI run on a phantom with known tensors and
+  command-line checks for every external tool call.
+
+### Fixed (v1.1.0-dev)
+- Reverse phase-encode b0 volumes with more than one volume produced a mismatch
+  between `acqparams.txt` rows and the topup input; they are now averaged.
+- Eigenvalue ordering check now also tests L2 ≥ L3 and cross-checks trace against
+  dtifit's tensor file.
+- Single shared NDE implementation (`nerves_dti.nde_from_eigenvalues`).
+
 ### Changed (behaviour — may alter results)
 - **Non-physical voxels (any eigenvalue ≤ 0) are now `NaN` in `nde.nii.gz`** instead
   of `0`, and are excluded from all summary statistics and QC. Previously they were

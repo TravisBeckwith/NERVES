@@ -39,7 +39,12 @@ Practically:
 - At **fixed FA**, NDE still varies with how the minor eigenvalues split (λ₂ vs λ₃),
   i.e. with tensor mode. That is the only information NDE adds to FA.
 - Tensor mode captures that same information directly and has an established
-  interpretation. If you need the λ₂/λ₃ contrast, report mode alongside NDE.
+  interpretation. In a Monte-Carlo simulation (SNR 25, 30 directions, b = 1000;
+  `validation/noise_simulation.py`) mode separated two voxel populations that
+  differ only in the λ₂/λ₃ split roughly **9–10× better** than NDE (d′ 3.3 vs 0.36),
+  while for FA-like changes NDE and FA performed alike. NERVES therefore writes
+  **tensor mode (and Westin shape indices) alongside NDE** by default (`--nde_only`
+  to disable).
 - Claims that NDE is more sensitive than FA to Wallerian degeneration, crossing
   fibres, etc. are **hypotheses, not results of this repository**: no clinical or
   phantom validation data are included. Treat NDE as an exploratory metric.
@@ -86,6 +91,7 @@ Raw DWI + T1
      ├── Tensor Estimation            (FSL: dtifit)
      │
      ├── NDE Computation              (Python/NumPy — native)
+     │     └── Shape maps: tensor mode, Westin cl/cp/cs
      │
      └── QC + Report
            ├── Metric histograms
@@ -176,7 +182,31 @@ python nde_pipeline.py \
     --out  ./nerves_output
 ```
 
-### ANTs Registration (rigid + affine)
+### Already-preprocessed DWI (e.g. HCP-style) — no FSL needed
+
+```bash
+python nde_pipeline.py \
+    --skip_dwi_preproc --tensor_fit python --wls \
+    --dwi dwi.nii.gz --bval dwi.bval --bvec dwi.bvec \
+    --mask brain_mask.nii.gz --max_b 1500 --out ./nerves_out
+```
+
+Adding `--t1 T1w.nii.gz` enables tissue-specific QC (needs FSL for BET/FAST/FLIRT).
+
+### Recommended options for noisy or multi-shell data
+
+```bash
+python nde_pipeline.py ... --wls --max_b 1500 --min_snr 10 --resume --n_threads 8
+```
+
+### BIDS dataset
+
+```bash
+python nerves_bids.py /data/bids --participant-label 01 02 -- --wls --resume
+python nerves_group_summary.py /data/bids/derivatives/nerves   # one CSV for all runs
+```
+
+### Registration options (rigid + affine ANTs, or boundary-based epi_reg)
 
 ```bash
 python nde_pipeline.py \
@@ -185,7 +215,7 @@ python nde_pipeline.py \
     --bvec sub-01_dwi.bvec   \
     --t1   sub-01_T1w.nii.gz \
     --out  ./sub-01_nerves   \
-    --use_ants
+    --registration ants      # or: --registration epi_reg (FSL boundary-based)
 ```
 
 ---
@@ -199,7 +229,8 @@ sub-01_nerves/
 │   ├── dwi_degibbs.mif           # Gibbs-corrected DWI
 │   ├── dwi_eddy.nii.gz           # Eddy-corrected DWI
 │   ├── mean_b0_final_brain.nii.gz
-│   └── mean_b0_final_brain_mask.nii.gz
+│   ├── mean_b0_final_brain_mask.nii.gz
+│   └── snr_map.nii.gz            # mean b0 / dwidenoise sigma (approximate)
 ├── t1/
 │   ├── T1_brain.nii.gz
 │   ├── T1_fast_pve_0.nii.gz      # CSF partial volume
@@ -214,8 +245,11 @@ sub-01_nerves/
 │   ├── dti_MD.nii.gz             # Mean diffusivity
 │   └── dti_RD.nii.gz             # Radial diffusivity = (λ₂+λ₃)/2
 ├── nde/
-│   ├── nde.nii.gz                # ★ PRIMARY OUTPUT: NDE map (NaN where undefined)
-│   └── nde_qc_flag.nii.gz        # Voxels with non-physical eigenvalues
+│   ├── nde.nii.gz                # ★ NDE map (NaN where undefined)
+│   └── nde_qc_flag.nii.gz        # 1 = non-physical eigenvalues, 2 = SNR < --min_snr
+├── shape/
+│   ├── mode.nii.gz               # Tensor mode (−1 planar … +1 linear)
+│   └── cl / cp / cs .nii.gz      # Westin linear / planar / spherical
 ├── qc/
 │   ├── qc_histograms.png         # NDE / FA / MD distributions in WM
 │   ├── qc_tissue_distributions.png  # NDE by tissue class
@@ -233,7 +267,7 @@ They are coarse screens, **not** validated quality criteria; always inspect the 
 
 | Metric | Expected | Interpretation if failed |
 |---|---|---|
-| Non-physical eigenvalue rate | < 5% (exit code 2 otherwise) | Tensor fitting or masking issue |
+| Non-physical eigenvalue rate | < 5% (exit code 2 otherwise) | Tensor fitting or masking issue (try `--wls`) |
 | CSF mean NDE (`csf_nde_pass`) | ≥ 0.90 | Registration / segmentation / tensor fit problem |
 | Tissue ordering (`tissue_ordering_pass`) | mean NDE CSF > GM > WM | Registration / segmentation / tensor fit problem |
 
@@ -244,12 +278,40 @@ resolution and how WM is defined.
 
 ---
 
+## Validation
+
+Claims about NDE should be tested, not assumed. The repository ships the tools:
+
+| Tool | What it answers |
+|---|---|
+| `python validation/noise_simulation.py` | How do NDE, FA, MD and tensor mode behave versus SNR, and how well does each detect three kinds of tissue change? |
+| `python validation/make_phantom.py --out DIR` | Synthetic DWI with known tensors, used by the end-to-end tests |
+| `python validation/retest_reliability.py manifest.csv` | ICC and within-subject CV on your own test-retest data |
+
+Current simulation results (OLS fit, SNR 25; d′ = separation of the two populations,
+higher is better) — **NDE adds little over FA and is much less sensitive than tensor
+mode to λ₂/λ₃ changes**:
+
+| Scenario | FA | MD | NDE | Mode |
+|---|---|---|---|---|
+| A: same FA and trace, different λ₂/λ₃ split | 0.01 | 0.01 | 0.36 | **3.32** |
+| B: symmetric radial diffusivity increase | **3.18** | 1.12 | 3.09 | 0.39 |
+| C: λ₂/λ₃ redistribution, similar trace | 0.06 | 0.01 | 0.16 | **1.55** |
+
+NDE is also biased low at low SNR (true 0.711; mean 0.687 at SNR 10 with OLS), which
+`--wls` and `--min_snr` mitigate. The simulation uses single-fibre tensors and a
+standard acquisition; it supports "NDE adds little", not a final verdict. See
+[Testing & validation](docs/testing.md).
+
+---
+
 ## Documentation
 
 - [Installation Guide](docs/installation.md)
 - [Pipeline Parameters](docs/parameters.md)
 - [NDE Theory](docs/theory.md)
 - [QC Interpretation](docs/qc_guide.md)
+- [Testing & validation](docs/testing.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Contributing](CONTRIBUTING.md)
 

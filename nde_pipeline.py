@@ -76,15 +76,25 @@ Usage
         [--rpe_b0 sub-01_b0_PA.nii.gz]  \\
         [--no_topup]              \\
         [--readout_time 0.062]    \\
-        [--use_ants]              \\
-        [--skip_preproc]          \\
-        [--l1 dti_L1.nii.gz --l2 dti_L2.nii.gz --l3 dti_L3.nii.gz \\
-         --mask brain_mask.nii.gz]
+        [--registration flirt|epi_reg|ants]  \\
+        [--wls] [--max_b 1000] [--min_snr 10]  \\
+        [--resume] [--n_threads 8] [--nde_only]
+
+    # Already-preprocessed (e.g. HCP-style) DWI: fit the tensor + NDE only
+    python nde_pipeline.py --skip_dwi_preproc --dwi dwi.nii.gz \\
+        --bval dwi.bval --bvec dwi.bvec --mask mask.nii.gz --out out
+
+    # Pre-computed eigenvalue maps
+    python nde_pipeline.py --skip_preproc \\
+        --l1 dti_L1.nii.gz --l2 dti_L2.nii.gz --l3 dti_L3.nii.gz \\
+        --mask brain_mask.nii.gz --out out
 
 Dependencies
 ------------
 Python  : numpy, nibabel, scipy, matplotlib  (pip)
-External: FSL ≥ 6.0, MRtrix3 ≥ 3.0.3, ANTs ≥ 2.3 (optional)
+External: FSL ≥ 6.0, MRtrix3 ≥ 3.0.3, ANTs ≥ 2.3 (optional);
+          none are needed with --skip_preproc, or with --skip_dwi_preproc
+          --tensor_fit python and a supplied --mask.
 """
 
 from __future__ import annotations
@@ -92,6 +102,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shlex
 import shutil
 import subprocess
@@ -107,6 +118,10 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 import nibabel as nib
 from scipy.stats import gaussian_kde, pearsonr
+
+import nerves_dti
+
+__version__ = "1.1.0-dev"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -153,52 +168,142 @@ def check_tool(name: str) -> bool:
     return shutil.which(name) is not None
 
 
-def validate_tools(use_ants: bool = False) -> None:
-    """Check required external tools are on PATH."""
-    required_fsl = ["bet", "eddy", "dtifit", "flirt", "fast",
-                    "fslmerge", "fslmaths"]
-    required_mrtrix = ["dwidenoise", "mrdegibbs", "mrconvert",
-                       "dwiextract", "mrmath"]
-    optional = ["topup", "applytopup", "applywarp"]
-    ants = ["antsRegistrationSyNQuick.sh", "antsApplyTransforms"]
+def find_eddy(gpu: bool = False) -> Optional[str]:
+    """Name of the first available ``eddy`` executable.
 
-    missing = []
-    for t in required_fsl + required_mrtrix:
-        if not check_tool(t):
-            missing.append(t)
+    FSL >= 6.0.4 ships ``eddy_cpu`` / ``eddy_cuda*`` (older releases
+    ``eddy_openmp`` or plain ``eddy``). GPU variants are only considered
+    when ``gpu`` is true.
+    """
+    cands = (["eddy_cuda", "eddy_cuda10.2", "eddy_cuda11.0"] if gpu else [])
+    cands += ["eddy_cpu", "eddy_openmp", "eddy"]
+    for c in cands:
+        if check_tool(c):
+            return c
+    return None
+
+
+def validate_tools(use_ants: bool = False, registration: Optional[str] = None,
+                   eddy_gpu: bool = False, tensor_fit: str = "dtifit",
+                   skip_dwi_preproc: bool = False,
+                   has_t1: bool = True) -> None:
+    """Check required external tools are on PATH.
+
+    The requirement set depends on the run mode: full preprocessing needs
+    FSL and MRtrix3; ``--skip_dwi_preproc`` needs only what the chosen
+    tensor fit and (optional) T1 processing use.
+    """
+    method = registration or ("ants" if use_ants else "flirt")
+    required = []
+    if not skip_dwi_preproc:
+        required += ["bet", "fslmerge", "fslmaths", "dwidenoise", "mrdegibbs",
+                     "mrconvert", "dwiextract", "mrmath"]
+    if tensor_fit == "dtifit":
+        required += ["dtifit"]
+    if has_t1:
+        required += ["bet", "flirt", "fast", "fslmaths"]
+        if method == "epi_reg":
+            required += ["epi_reg", "convert_xfm"]
+    missing = sorted(set(t for t in required if not check_tool(t)))
+    if not skip_dwi_preproc and find_eddy(eddy_gpu) is None:
+        missing.append("eddy (eddy_cpu / eddy_openmp / eddy)")
     if missing:
         raise EnvironmentError(
             f"Missing required tools: {missing}\n"
             "Install FSL (https://fsl.fmrib.ox.ac.uk) and "
             "MRtrix3 (https://www.mrtrix.org)."
         )
-    for t in optional:
-        if not check_tool(t):
-            log.warning("Optional tool not found: %s", t)
-    if use_ants:
-        for t in ants:
+    if not skip_dwi_preproc:
+        for t in ["topup", "applytopup"]:
             if not check_tool(t):
-                log.warning("ANTs tool not found: %s (needed for --use_ants)", t)
+                log.warning("Optional tool not found: %s", t)
+    if method == "ants":
+        for t in ["antsRegistrationSyNQuick.sh", "antsApplyTransforms"]:
+            if not check_tool(t):
+                log.warning("ANTs tool not found: %s (needed for ANTs "
+                            "registration)", t)
+
+
+def collect_versions() -> dict:
+    """Software versions for the report (best effort, never raises)."""
+    import platform
+    import scipy
+    v = {"nerves": __version__, "python": platform.python_version(),
+         "numpy": np.__version__, "nibabel": nib.__version__,
+         "scipy": scipy.__version__, "matplotlib": matplotlib.__version__}
+    try:
+        fsldir = os.environ.get("FSLDIR")
+        vf = Path(fsldir) / "etc" / "fslversion" if fsldir else None
+        if vf is not None and vf.exists():
+            v["fsl"] = vf.read_text().strip().split(":")[0]
+    except Exception:
+        pass
+    try:
+        if check_tool("mrconvert"):
+            r = subprocess.run(["mrconvert", "-version"], capture_output=True,
+                               text=True, timeout=20)
+            first = (r.stdout or r.stderr).strip().splitlines()
+            if first:
+                v["mrtrix3"] = first[0].strip()
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=10,
+                           cwd=Path(__file__).resolve().parent)
+        if r.returncode == 0 and r.stdout.strip():
+            v["git_commit"] = r.stdout.strip()
+    except Exception:
+        pass
+    return v
+
+
+def _stage_done(resume: bool, label: str, *paths: Path) -> bool:
+    """True (and logged) when --resume is on and every output already exists."""
+    if resume and all(Path(p).exists() and Path(p).stat().st_size > 0
+                      for p in paths):
+        log.info("Resume: skipping %s (outputs exist)", label)
+        return True
+    return False
+
+
+def _thr(n_threads: int) -> list:
+    """MRtrix3 ``-nthreads`` arguments."""
+    return ["-nthreads", str(n_threads)] if n_threads else []
+
+
+# Phase-encode direction -> acqparams vector. Named directions (AP, PA, LR,
+# RL) and BIDS axis codes (i, i-, j, j-, k, k-) are both accepted.
+PE_VECTORS = {
+    "AP": (0, -1, 0), "PA": (0, 1, 0), "LR": (-1, 0, 0), "RL": (1, 0, 0),
+    "i": (1, 0, 0), "i-": (-1, 0, 0), "j": (0, 1, 0), "j-": (0, -1, 0),
+    "k": (0, 0, 1), "k-": (0, 0, -1),
+}
+PE_CHOICES = list(PE_VECTORS)
 
 
 # ===========================================================================
 # 2. DWI Preprocessing
 # ===========================================================================
 
-def _mean_b0(dwi_mif: Path, out_nii: Path, tmp_mif: Path) -> None:
+def _mean_b0(dwi_mif: Path, out_nii: Path, tmp_mif: Path,
+             n_threads: int = 0) -> None:
     """Mean of the b=0 volumes of ``dwi_mif`` -> ``out_nii``.
 
     Uses an intermediate file instead of a shell pipe so that a failure in
     ``dwiextract`` is not masked by a successful ``mrmath``.
     """
-    run(["dwiextract", dwi_mif, "-bzero", tmp_mif, "-force"])
-    run(["mrmath", tmp_mif, "mean", out_nii, "-axis", "3", "-force"])
+    run(["dwiextract", dwi_mif, "-bzero", tmp_mif, "-force"] + _thr(n_threads))
+    run(["mrmath", tmp_mif, "mean", out_nii, "-axis", "3", "-force"]
+        + _thr(n_threads))
 
 
 def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
                    out_dir: Path, pe_dir: str = "AP",
                    rpe_b0: Optional[Path] = None,
-                   readout_time: float = 0.05) -> dict:
+                   readout_time: float = 0.05,
+                   resume: bool = False, n_threads: int = 0,
+                   eddy_gpu: bool = False) -> dict:
     """
     Full DWI preprocessing:
       denoising → Gibbs removal → topup (optional) → eddy → bet mask
@@ -208,86 +313,95 @@ def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
     readout_time : float
         Total readout time in seconds, used in acqparams.txt for topup and
         eddy. Scanner- and sequence-dependent — derive it from your DICOM
-        headers as EffectiveEchoSpacing x (PhaseEncodingSteps - 1). The
-        default (0.05s) is a placeholder, not a measured value for your
-        acquisition; pass --readout_time on the command line to set it
-        correctly rather than editing this default.
+        headers as EffectiveEchoSpacing x (PhaseEncodingSteps - 1), or from
+        the BIDS ``TotalReadoutTime`` field. The default (0.05s) is a
+        placeholder, not a measured value for your acquisition.
+    resume : bool
+        Skip stages whose output files already exist (eddy can take hours).
+    n_threads : int
+        Threads for MRtrix3 tools and eddy (0 = tool default).
+    eddy_gpu : bool
+        Prefer a CUDA build of eddy if installed.
 
     Returns dict of output paths.
     """
     log.info("=== DWI Preprocessing ===")
     out_dir.mkdir(parents=True, exist_ok=True)
+    thr = _thr(n_threads)
 
-    # --- Convert input NIfTI → MIF for MRtrix3 ---
     dwi_mif = out_dir / "dwi_raw.mif"
-    run(["mrconvert", dwi, "-fslgrad", bvec, bval, dwi_mif, "-force"])
-
-    # --- 2a. MP-PCA denoising ---
-    log.info("Step 2a: MP-PCA denoising")
     dwi_den = out_dir / "dwi_denoised.mif"
     noise_map = out_dir / "noise_map.nii.gz"
-    run(["dwidenoise", dwi_mif, dwi_den, "-noise", noise_map, "-force"])
+    dwi_deg = out_dir / "dwi_degibbs.mif"
+    dwi_deg_nii = out_dir / "dwi_degibbs.nii.gz"
+    bvecs_deg = out_dir / "dwi_degibbs.bvec"
+    bvals_deg = out_dir / "dwi_degibbs.bval"
+
+    # --- 2a. MP-PCA denoising (also yields the noise sigma map) ---
+    log.info("Step 2a: MP-PCA denoising")
+    if not _stage_done(resume, "denoising", dwi_den, noise_map):
+        run(["mrconvert", dwi, "-fslgrad", bvec, bval, dwi_mif, "-force"]
+            + thr)
+        run(["dwidenoise", dwi_mif, dwi_den, "-noise", noise_map, "-force"]
+            + thr)
 
     # --- 2b. Gibbs ringing removal ---
     log.info("Step 2b: Gibbs ringing removal")
-    dwi_deg = out_dir / "dwi_degibbs.mif"
-    # NOTE: mrdegibbs assumes slices are acquired along the third image
-    # axis (axial acquisition); see docs/troubleshooting.md for -axes.
-    run(["mrdegibbs", dwi_den, dwi_deg, "-force"])
-
-    # Convert degibbs output to NIfTI for FSL tools
-    dwi_deg_nii = out_dir / "dwi_degibbs.nii.gz"
-    bvecs_deg   = out_dir / "dwi_degibbs.bvec"
-    bvals_deg   = out_dir / "dwi_degibbs.bval"
-    run(["mrconvert", dwi_deg, dwi_deg_nii,
-         "-export_grad_fsl", bvecs_deg, bvals_deg, "-force"])
+    if not _stage_done(resume, "Gibbs removal", dwi_deg, dwi_deg_nii,
+                       bvecs_deg, bvals_deg):
+        # NOTE: mrdegibbs assumes slices are acquired along the third image
+        # axis (axial acquisition); see docs/troubleshooting.md for -axes.
+        run(["mrdegibbs", dwi_den, dwi_deg, "-force"] + thr)
+        run(["mrconvert", dwi_deg, dwi_deg_nii,
+             "-export_grad_fsl", bvecs_deg, bvals_deg, "-force"] + thr)
 
     # --- 2c. Initial brain mask from mean b=0 ---
     log.info("Step 2c: Initial brain masking")
     mean_b0 = out_dir / "mean_b0.nii.gz"
-    _mean_b0(dwi_deg, mean_b0, out_dir / "b0_vols_tmp.mif")
     mean_b0_brain = out_dir / "mean_b0_brain"
-    run(["bet", mean_b0, mean_b0_brain, "-m", "-f", "0.3"])
     mask_init = out_dir / "mean_b0_brain_mask.nii.gz"
+    if not _stage_done(resume, "initial mask", mean_b0, mask_init):
+        _mean_b0(dwi_deg, mean_b0, out_dir / "b0_vols_tmp.mif", n_threads)
+        run(["bet", mean_b0, mean_b0_brain, "-m", "-f", "0.3"])
 
     # --- 2d. Topup (optional) ---
     topup_results = None
     acqparams = out_dir / "acqparams.txt"
-
-    pe_map = {
-        "AP": (0, -1, 0), "PA": (0, 1, 0),
-        "LR": (-1, 0, 0), "RL": (1, 0, 0),
-    }
-    pe_vec = pe_map.get(pe_dir.upper(), (0, -1, 0))
+    pe_key = pe_dir if pe_dir in PE_VECTORS else pe_dir.upper()
+    pe_vec = PE_VECTORS.get(pe_key, (0, -1, 0))
     rpe_vec = tuple(-v for v in pe_vec)
 
     if rpe_b0 is not None and check_tool("topup"):
         log.info("Step 2d: Topup susceptibility distortion correction")
         rpe_b0_nii = out_dir / "rpe_b0.nii.gz"
-        shutil.copy(rpe_b0, rpe_b0_nii)
-
         b0_pair = out_dir / "b0_pair.nii.gz"
-        run(["fslmerge", "-t", b0_pair, mean_b0, rpe_b0_nii])
-
         with open(acqparams, "w") as f:
             f.write(f"{pe_vec[0]} {pe_vec[1]} {pe_vec[2]} {readout_time}\n")
             f.write(f"{rpe_vec[0]} {rpe_vec[1]} {rpe_vec[2]} {readout_time}\n")
-
         topup_results = out_dir / "topup_results"
-        run(["topup", f"--imain={b0_pair}", f"--datain={acqparams}",
-             "--config=b02b0.cnf", f"--out={topup_results}",
-             f"--fout={out_dir / 'field_map.nii.gz'}"])
+        topup_coef = Path(str(topup_results) + "_fieldcoef.nii.gz")
+        mask_topup = out_dir / "mean_b0_topup_brain_mask.nii.gz"
+        if not _stage_done(resume, "topup", topup_coef):
+            # Average the reverse-PE b0(s) so there is exactly one volume,
+            # matching the one acqparams row written for it.
+            run(["fslmaths", rpe_b0, "-Tmean", rpe_b0_nii])
+            run(["fslmerge", "-t", b0_pair, mean_b0, rpe_b0_nii])
+            run(["topup", f"--imain={b0_pair}", f"--datain={acqparams}",
+                 "--config=b02b0.cnf", f"--out={topup_results}",
+                 f"--fout={out_dir / 'field_map.nii.gz'}"])
 
         # The eddy brain mask must be defined on the *distortion-corrected*
         # b0, otherwise it is misaligned with the data topup hands to eddy.
         if check_tool("applytopup"):
-            mean_b0_corr = out_dir / "mean_b0_topup.nii.gz"
-            run(["applytopup", f"--imain={mean_b0}", f"--datain={acqparams}",
-                 "--inindex=1", f"--topup={topup_results}",
-                 f"--out={mean_b0_corr}", "--method=jac"])
-            mean_b0_brain = out_dir / "mean_b0_topup_brain"
-            run(["bet", mean_b0_corr, mean_b0_brain, "-m", "-f", "0.3"])
-            mask_init = out_dir / "mean_b0_topup_brain_mask.nii.gz"
+            if not _stage_done(resume, "topup-corrected mask", mask_topup):
+                mean_b0_corr = out_dir / "mean_b0_topup.nii.gz"
+                run(["applytopup", f"--imain={mean_b0}",
+                     f"--datain={acqparams}", "--inindex=1",
+                     f"--topup={topup_results}", f"--out={mean_b0_corr}",
+                     "--method=jac"])
+                run(["bet", mean_b0_corr, out_dir / "mean_b0_topup_brain",
+                     "-m", "-f", "0.3"])
+            mask_init = mask_topup
         else:
             log.warning("applytopup not found; eddy mask is defined on the "
                         "uncorrected b0.")
@@ -307,29 +421,34 @@ def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
         f.write(" ".join(["1"] * n_vols) + "\n")
 
     eddy_out = out_dir / "dwi_eddy"
-    eddy_cmd = [
-        "eddy", f"--imain={dwi_deg_nii}", f"--mask={mask_init}",
-        f"--acqp={acqparams}", f"--index={index_file}",
-        f"--bvecs={bvecs_deg}", f"--bvals={bvals_deg}",
-        "--repol", f"--out={eddy_out}",
-    ]
-    if topup_results is not None:
-        eddy_cmd.append(f"--topup={topup_results}")
-    run(eddy_cmd)
-
-    eddy_nii    = Path(str(eddy_out) + ".nii.gz")
-    eddy_bvecs  = Path(str(eddy_out) + ".eddy_rotated_bvecs")
+    eddy_nii = Path(str(eddy_out) + ".nii.gz")
+    eddy_bvecs = Path(str(eddy_out) + ".eddy_rotated_bvecs")
+    if not _stage_done(resume, "eddy", eddy_nii, eddy_bvecs):
+        eddy_cmd = [
+            find_eddy(eddy_gpu) or "eddy",
+            f"--imain={dwi_deg_nii}", f"--mask={mask_init}",
+            f"--acqp={acqparams}", f"--index={index_file}",
+            f"--bvecs={bvecs_deg}", f"--bvals={bvals_deg}",
+            "--repol", f"--out={eddy_out}",
+        ]
+        if n_threads:
+            eddy_cmd.append(f"--nthr={n_threads}")
+        if topup_results is not None:
+            eddy_cmd.append(f"--topup={topup_results}")
+        run(eddy_cmd)
 
     # --- Final brain mask from eddy-corrected data ---
     log.info("Step 2e (post): Final brain masking on eddy output")
     mean_b0_eddy = out_dir / "mean_b0_eddy.nii.gz"
-    eddy_mif     = out_dir / "dwi_eddy.mif"
-    run(["mrconvert", eddy_nii, "-fslgrad", eddy_bvecs, bvals_deg,
-         eddy_mif, "-force"])
-    _mean_b0(eddy_mif, mean_b0_eddy, out_dir / "b0_vols_tmp.mif")
+    eddy_mif = out_dir / "dwi_eddy.mif"
     mean_b0_final = out_dir / "mean_b0_final_brain"
-    run(["bet", mean_b0_eddy, mean_b0_final, "-m", "-f", "0.3"])
     mask_final = out_dir / "mean_b0_final_brain_mask.nii.gz"
+    if not _stage_done(resume, "final mask", mean_b0_eddy, mask_final):
+        run(["mrconvert", eddy_nii, "-fslgrad", eddy_bvecs, bvals_deg,
+             eddy_mif, "-force"] + thr)
+        _mean_b0(eddy_mif, mean_b0_eddy, out_dir / "b0_vols_tmp.mif",
+                 n_threads)
+        run(["bet", mean_b0_eddy, mean_b0_final, "-m", "-f", "0.3"])
 
     return {
         "dwi_eddy":  eddy_nii,
@@ -337,6 +456,8 @@ def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
         "bvals":     bvals_deg,
         "mask":      mask_final,
         "mean_b0":   mean_b0_eddy,
+        "mean_b0_brain": Path(str(mean_b0_final) + ".nii.gz"),
+        "noise_map": noise_map,
     }
 
 
@@ -345,35 +466,52 @@ def preprocess_dwi(dwi: Path, bval: Path, bvec: Path,
 # ===========================================================================
 
 def preprocess_t1(t1: Path, dwi_ref: Path,
-                  out_dir: Path, use_ants: bool = False) -> dict:
+                  out_dir: Path, use_ants: bool = False,
+                  registration: Optional[str] = None,
+                  dwi_ref_brain: Optional[Path] = None,
+                  resume: bool = False) -> dict:
     """
     T1 brain extraction, tissue segmentation, and registration to DWI space.
+
+    ``registration``: ``"flirt"`` (6-DOF, normalised mutual information;
+    default), ``"epi_reg"`` (FSL boundary-based registration using the WM
+    segmentation; needs ``dwi_ref_brain``, a brain-extracted b=0) or
+    ``"ants"`` (rigid + affine). ``use_ants`` is kept for compatibility.
 
     Returns dict of output paths including tissue probability maps.
     """
     log.info("=== T1 Preprocessing ===")
     out_dir.mkdir(parents=True, exist_ok=True)
+    method = registration or ("ants" if use_ants else "flirt")
+    if method not in ("flirt", "epi_reg", "ants"):
+        raise ValueError(f"Unknown registration method: {method}")
 
     # --- 3a. Brain extraction ---
     log.info("Step 3a: T1 brain extraction")
     t1_brain = out_dir / "T1_brain"
-    run(["bet", t1, t1_brain, "-R", "-f", "0.35", "-g", "0"])
     t1_brain_nii = Path(str(t1_brain) + ".nii.gz")
+    if not _stage_done(resume, "T1 brain extraction", t1_brain_nii):
+        run(["bet", t1, t1_brain, "-R", "-f", "0.35", "-g", "0"])
 
     # --- 3b. Tissue segmentation with FAST ---
     log.info("Step 3b: FSL FAST tissue segmentation (3-class)")
     fast_base = out_dir / "T1_fast"
-    run(["fast", "-t", "1", "-n", "3", "-H", "0.1", "-I", "4", "-l", "20.0",
-         "-o", fast_base, t1_brain_nii])
     # FAST outputs: _pve_0 = CSF, _pve_1 = GM, _pve_2 = WM
     pve_csf = Path(str(fast_base) + "_pve_0.nii.gz")
     pve_gm  = Path(str(fast_base) + "_pve_1.nii.gz")
     pve_wm  = Path(str(fast_base) + "_pve_2.nii.gz")
+    if not _stage_done(resume, "FAST", pve_csf, pve_gm, pve_wm):
+        run(["fast", "-t", "1", "-n", "3", "-H", "0.1", "-I", "4", "-l", "20.0",
+             "-o", fast_base, t1_brain_nii])
 
     # --- 3c. Registration T1 → DWI space ---
-    log.info("Step 3c: Registering T1 → DWI space")
-
-    if use_ants and check_tool("antsRegistrationSyNQuick.sh"):
+    log.info("Step 3c: Registering T1 → DWI space (%s)", method)
+    warped_pves = {
+        n: out_dir / f"T1_pve_{n}_DWIspace.nii.gz" for n in ("csf", "gm", "wm")
+    }
+    if _stage_done(resume, "registration", *warped_pves.values()):
+        pass
+    elif method == "ants" and check_tool("antsRegistrationSyNQuick.sh"):
         # '-t a' = rigid + affine only (no nonlinear SyN stage). Only the
         # affine matrix is applied below, which is what is actually wanted
         # for a within-subject T1 -> DWI alignment.
@@ -382,33 +520,39 @@ def preprocess_t1(t1: Path, dwi_ref: Path,
         run(["antsRegistrationSyNQuick.sh", "-d", "3",
              "-f", dwi_ref, "-m", t1_brain_nii,
              "-o", ants_prefix, "-t", "a"])
-
-        # Apply transform to PVE maps
-        warped_pves = {}
         for name, pve in [("csf", pve_csf), ("gm", pve_gm), ("wm", pve_wm)]:
-            out_pve = out_dir / f"T1_pve_{name}_DWIspace.nii.gz"
             run(["antsApplyTransforms", "-d", "3",
                  "-i", pve, "-r", dwi_ref,
                  "-t", f"{ants_prefix}0GenericAffine.mat",
-                 "-n", "Linear", "-o", out_pve])
-            warped_pves[name] = out_pve
+                 "-n", "Linear", "-o", warped_pves[name]])
     else:
-        if use_ants:
+        if method == "ants":
             log.warning("ANTs not found; falling back to FSL FLIRT")
-        log.info("  Using FSL FLIRT affine registration")
+            method = "flirt"
         xfm = out_dir / "T1_to_DWI.mat"
-        t1_in_dwi = out_dir / "T1_brain_DWIspace.nii.gz"
-        run(["flirt", "-in", t1_brain_nii, "-ref", dwi_ref,
-             "-out", t1_in_dwi, "-omat", xfm,
-             "-dof", "6", "-cost", "normmi"])
-
-        warped_pves = {}
+        if method == "epi_reg" and dwi_ref_brain is not None:
+            log.info("  Using FSL epi_reg (boundary-based registration)")
+            wm_seg = out_dir / "T1_wmseg.nii.gz"
+            run(["fslmaths", pve_wm, "-thr", "0.5", "-bin", wm_seg])
+            epi_prefix = out_dir / "epi2t1"
+            run(["epi_reg", f"--epi={dwi_ref_brain}", f"--t1={t1}",
+                 f"--t1brain={t1_brain_nii}", f"--wmseg={wm_seg}",
+                 f"--out={epi_prefix}"])
+            run(["convert_xfm", "-omat", xfm, "-inverse",
+                 Path(str(epi_prefix) + ".mat")])
+        else:
+            if method == "epi_reg":
+                log.warning("epi_reg needs a brain-extracted b=0; falling "
+                            "back to FLIRT")
+            log.info("  Using FSL FLIRT affine registration")
+            t1_in_dwi = out_dir / "T1_brain_DWIspace.nii.gz"
+            run(["flirt", "-in", t1_brain_nii, "-ref", dwi_ref,
+                 "-out", t1_in_dwi, "-omat", xfm,
+                 "-dof", "6", "-cost", "normmi"])
         for name, pve in [("csf", pve_csf), ("gm", pve_gm), ("wm", pve_wm)]:
-            out_pve = out_dir / f"T1_pve_{name}_DWIspace.nii.gz"
             run(["flirt", "-in", pve, "-ref", dwi_ref,
                  "-applyxfm", "-init", xfm,
-                 "-out", out_pve, "-interp", "trilinear"])
-            warped_pves[name] = out_pve
+                 "-out", warped_pves[name], "-interp", "trilinear"])
 
     return {
         "t1_brain": t1_brain_nii,
@@ -423,19 +567,22 @@ def preprocess_t1(t1: Path, dwi_ref: Path,
 # ===========================================================================
 
 def estimate_tensor(dwi: Path, bvecs: Path, bvals: Path,
-                    mask: Path, out_dir: Path) -> dict:
+                    mask: Path, out_dir: Path,
+                    wls: bool = False, method: str = "dtifit",
+                    resume: bool = False) -> dict:
     """
-    Fit diffusion tensor and extract eigenvalue maps using FSL DTIFIT.
+    Fit the diffusion tensor and extract eigenvalue maps.
 
-    Eigenvalues are output in descending order: L1 ≥ L2 ≥ L3
-    (convention verified: L1 = axial diffusivity, RD = (L2+L3)/2).
+    ``method="dtifit"`` uses FSL DTIFIT (``--wls`` adds weighted least
+    squares); ``method="python"`` uses the native NumPy fit in
+    ``nerves_dti`` (OLS, or WLS when ``wls``) and needs no FSL.
+
+    Eigenvalues are output in descending order: L1 ≥ L2 ≥ L3.
     """
-    log.info("=== Diffusion Tensor Estimation (FSL dtifit) ===")
+    log.info("=== Diffusion Tensor Estimation (%s%s) ===",
+             "FSL dtifit" if method == "dtifit" else "native NumPy",
+             ", WLS" if wls else "")
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    dti_prefix = out_dir / "dti"
-    run(["dtifit", "-k", dwi, "-m", mask, "-r", bvecs, "-b", bvals,
-         "-o", dti_prefix, "--save_tensor"])
 
     l1 = out_dir / "dti_L1.nii.gz"
     l2 = out_dir / "dti_L2.nii.gz"
@@ -444,22 +591,50 @@ def estimate_tensor(dwi: Path, bvecs: Path, bvals: Path,
     md = out_dir / "dti_MD.nii.gz"
     rd = out_dir / "dti_RD.nii.gz"
 
+    if _stage_done(resume, "tensor fit", l1, l2, l3, fa, md):
+        pass
+    elif method == "python":
+        nerves_dti.estimate_tensor_numpy(
+            dwi, bvecs, bvals, mask, out_dir,
+            method="wls" if wls else "ols")
+    else:
+        cmd = ["dtifit", "-k", dwi, "-m", mask, "-r", bvecs, "-b", bvals,
+               "-o", out_dir / "dti", "--save_tensor"]
+        if wls:
+            cmd.append("-w")
+        run(cmd)
+
     # Compute RD = (L2 + L3) / 2 if not already written
     if not rd.exists():
         run(["fslmaths", l2, "-add", l3, "-div", "2", rd])
 
-    # Verify eigenvalue ordering: L1 should exceed L2 everywhere in mask
+    # Verify eigenvalue ordering (L1 >= L2 >= L3) inside the mask
     l1_data = nib.load(str(l1)).get_fdata()
     l2_data = nib.load(str(l2)).get_fdata()
+    l3_data = nib.load(str(l3)).get_fdata()
     mask_data = nib.load(str(mask)).get_fdata().astype(bool)
-    violations = np.sum(l1_data[mask_data] < l2_data[mask_data])
-    total = np.sum(mask_data)
-    if violations > 0:
-        log.warning("Eigenvalue ordering check: %d/%d voxels have L1 < L2 "
-                    "(%.2f%%). Verify dtifit output.",
-                    violations, total, 100 * violations / total)
+    v = nerves_dti.ordering_violations(l1_data, l2_data, l3_data, mask_data)
+    if v["l1_lt_l2"] or v["l2_lt_l3"]:
+        tot = max(v["n_mask"], 1)
+        log.warning("Eigenvalue ordering check: L1<L2 in %d and L2<L3 in %d "
+                    "of %d voxels (%.2f%% / %.2f%%). Verify the tensor fit.",
+                    v["l1_lt_l2"], v["l2_lt_l3"], v["n_mask"],
+                    100 * v["l1_lt_l2"] / tot, 100 * v["l2_lt_l3"] / tot)
     else:
-        log.info("Eigenvalue ordering check passed: L1 ≥ L2 in all voxels.")
+        log.info("Eigenvalue ordering check passed: L1 ≥ L2 ≥ L3 in all "
+                 "voxels.")
+
+    # Cross-check against dtifit's own tensor file (trace consistency)
+    dev = nerves_dti.trace_consistency(
+        out_dir / "dti_tensor.nii.gz", l1_data, l2_data, l3_data, mask_data)
+    if dev is not None:
+        if dev > 1e-2:
+            log.warning("Tensor trace and L1+L2+L3 disagree (median relative "
+                        "difference %.3g); eigenvalue and tensor files may "
+                        "not belong together.", dev)
+        else:
+            log.info("Tensor trace consistency OK (median rel. diff %.2g).",
+                     dev)
 
     return {"l1": l1, "l2": l2, "l3": l3, "fa": fa, "md": md, "rd": rd}
 
@@ -469,7 +644,9 @@ def estimate_tensor(dwi: Path, bvecs: Path, bvals: Path,
 # ===========================================================================
 
 def compute_nde(l1_path: Path, l2_path: Path, l3_path: Path,
-                mask_path: Path, out_dir: Path) -> dict:
+                mask_path: Path, out_dir: Path,
+                snr_path: Optional[Path] = None,
+                min_snr: float = 0.0) -> dict:
     """
     Compute Normalized Diffusion Entropy (NDE) from DTI eigenvalue maps.
 
@@ -485,6 +662,10 @@ def compute_nde(l1_path: Path, l2_path: Path, l3_path: Path,
                     "maximally anisotropic", and such voxels are typically
                     the noisy, high-anisotropy ones. They are excluded from
                     all summary statistics and QC.
+    - SNR < ``min_snr`` (when ``snr_path`` and ``min_snr`` > 0 are given)
+                  → flagged with value 2 in the QC mask and NDE = NaN.
+                    NDE is biased low at low SNR (see docs/theory.md), so
+                    unreliable voxels can be excluded.
     - pᵢ = 0      → 0 · ln(0) defined as 0 (L'Hôpital / continuity)
     - All λᵢ equal → NDE = 1 (maximum entropy, perfectly isotropic)
     - Outside mask → NDE = 0 (not computed; excluded from statistics)
@@ -510,21 +691,27 @@ def compute_nde(l1_path: Path, l2_path: Path, l3_path: Path,
     qc_flag[non_phys] = 1
     nde_vol[non_phys] = np.nan         # undefined, not "0 = fully anisotropic"
 
+    n_low_snr = 0
+    if snr_path is not None and min_snr > 0:
+        snr = nib.load(str(snr_path)).get_fdata()
+        if snr.shape != valid.shape:
+            raise ValueError(f"SNR map shape {snr.shape} != eigenvalue grid "
+                             f"{valid.shape}")
+        low_snr = valid & ~(snr >= min_snr)
+        n_low_snr = int(low_snr.sum())
+        qc_flag[low_snr] = 2
+        nde_vol[low_snr] = np.nan
+        valid = valid & ~low_snr
+    elif min_snr > 0:
+        log.warning("--min_snr given but no SNR map is available; no SNR "
+                    "masking applied.")
+
     # Stack eigenvalues for vectorised computation: shape (N_valid, 3)
     eigs = np.stack([l1[valid], l2[valid], l3[valid]], axis=-1)
 
-    # Normalise to proportions (sum-normalisation)
     # Scale-invariant: multiplying all eigenvalues by a constant leaves
-    # NDE unchanged — only the relative distribution matters.
-    eig_sum = eigs.sum(axis=-1, keepdims=True)          # (N, 1)
-    p       = eigs / eig_sum                             # (N, 3)
-
-    # Shannon entropy: use np.where so that p=0 → 0·ln(0) = 0 (not NaN)
-    log_p = np.where(p > 0.0, np.log(p), 0.0)
-    H     = -np.sum(p * log_p, axis=-1)                 # (N,)
-
-    # Normalise: NDE ∈ [0, 1]
-    nde_vals = np.clip(H / np.log(3.0), 0.0, 1.0)
+    # NDE unchanged -- only the relative distribution matters.
+    nde_vals = nerves_dti.nde_from_eigenvalues(eigs)
     nde_vol[valid] = nde_vals.astype(np.float32)
 
     # Save NDE map
@@ -555,6 +742,7 @@ def compute_nde(l1_path: Path, l2_path: Path, l3_path: Path,
         "n_valid_voxels":     n_valid,
         "n_nonphysical":      n_nonphys,
         "nonphysical_pct":    round(nonphys_pct, 3),
+        "n_low_snr":          n_low_snr,
         "nde_mean":           float(np.mean(nde_brain)),
         "nde_std":            float(np.std(nde_brain)),
         "nde_median":         float(np.median(nde_brain)),
@@ -568,6 +756,8 @@ def compute_nde(l1_path: Path, l2_path: Path, l3_path: Path,
     log.info("  Voxels in mask:        %d", n_mask)
     log.info("  Valid (computed):      %d", n_valid)
     log.info("  Non-physical flagged:  %d  (%.2f%%)", n_nonphys, nonphys_pct)
+    if n_low_snr:
+        log.info("  Low-SNR excluded:      %d  (SNR < %g)", n_low_snr, min_snr)
     if nonphys_pct > 5.0:
         log.warning("Non-physical eigenvalue rate %.2f%% exceeds "
                     "recommended threshold of 5%%.", nonphys_pct)
@@ -609,9 +799,6 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
     nde   = nib.load(str(nde_path)).get_fdata()
     fa    = nib.load(str(fa_path)).get_fdata()
     md    = nib.load(str(md_path)).get_fdata()
-    l1    = nib.load(str(l1_path)).get_fdata()
-    l2    = nib.load(str(l2_path)).get_fdata()
-    l3    = nib.load(str(l3_path)).get_fdata()
 
     # Only voxels with a defined NDE take part in QC (flagged voxels are NaN)
     valid_nde = np.isfinite(nde)
@@ -695,7 +882,7 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
                      color="white")
         ax.tick_params(colors="white")
         ax.set_xlim(0, 1)
-        leg = ax.legend(fontsize=10, facecolor="#2E2E4E",
+        ax.legend(fontsize=10, facecolor="#2E2E4E",
                         labelcolor="white", framealpha=0.8)
         fig.tight_layout()
         fig.savefig(out_dir / "qc_tissue_distributions.png", dpi=200,
@@ -746,6 +933,7 @@ def run_qc(nde_path: Path, fa_path: Path, md_path: Path,
 
     r, pval = pearsonr(fa_wm[idx], nde_wm[idx])
     qc_results["nde_fa_pearson_r"] = float(r)   # informational only
+    qc_results["nde_variance_explained_by_fa"] = float(r * r)
 
     fig, ax = plt.subplots(figsize=(8, 7))
     ax.scatter(fa_wm[idx], nde_wm[idx], s=1, alpha=0.15,
@@ -822,7 +1010,8 @@ def _make_montage(nde: np.ndarray, fa: np.ndarray, md: np.ndarray,
 # ===========================================================================
 
 def write_report(out_dir: Path, nde_stats: dict, qc_results: dict,
-                 args_dict: dict) -> None:
+                 args_dict: dict, versions: Optional[dict] = None,
+                 extra: Optional[dict] = None) -> None:
     """Write a JSON summary report."""
 
     class _NumpySafeEncoder(json.JSONEncoder):
@@ -875,6 +1064,10 @@ def write_report(out_dir: Path, nde_stats: dict, qc_results: dict,
             "PLoS One. 2013;8(10):e76343 (related; different estimator)."
         ),
     }
+    if versions:
+        report["versions"] = versions
+    if extra:
+        report.update(extra)
     rpt_path = out_dir / "nde_pipeline_report.json"
     with open(rpt_path, "w") as f:
         json.dump(report, f, indent=2, cls=_NumpySafeEncoder)
@@ -885,45 +1078,66 @@ def write_report(out_dir: Path, nde_stats: dict, qc_results: dict,
 # 8. Main entry point
 # ===========================================================================
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="NDE Pipeline: Normalized Diffusion Entropy from T1 + DWI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    p.add_argument("--version", action="version",
+                   version=f"nerves {__version__}")
 
-    # --- Required inputs ---
-    p.add_argument("--dwi",  required=True, type=Path,
-                   help="4D DWI NIfTI (.nii / .nii.gz)")
-    p.add_argument("--bval", required=True, type=Path,
-                   help="FSL bval file")
-    p.add_argument("--bvec", required=True, type=Path,
-                   help="FSL bvec file")
-    p.add_argument("--t1",   required=True, type=Path,
-                   help="3D T1-weighted NIfTI")
+    # --- Inputs (requirements depend on the run mode; checked in main) ---
+    p.add_argument("--dwi",  type=Path, default=None,
+                   help="4D DWI NIfTI (.nii / .nii.gz). With "
+                        "--skip_dwi_preproc: already corrected data whose "
+                        "bvecs/bvals are final")
+    p.add_argument("--bval", type=Path, default=None, help="FSL bval file")
+    p.add_argument("--bvec", type=Path, default=None, help="FSL bvec file")
+    p.add_argument("--t1",   type=Path, default=None,
+                   help="3D T1-weighted NIfTI (required for full "
+                        "preprocessing; optional with --skip_dwi_preproc, "
+                        "enabling tissue-specific QC)")
     p.add_argument("--out",  required=True, type=Path,
                    help="Output directory (created if absent)")
 
-    # --- Optional inputs ---
-    p.add_argument("--pe_dir", default="AP",
-                   choices=["AP", "PA", "LR", "RL"],
-                   help="Phase-encode direction (default: AP)")
+    # --- Acquisition / preprocessing options ---
+    p.add_argument("--pe_dir", default="AP", choices=PE_CHOICES,
+                   help="Phase-encode direction: AP, PA, LR, RL or the BIDS "
+                        "axis code (i, i-, j, j-, k, k-). Default: AP")
     p.add_argument("--rpe_b0", type=Path, default=None,
-                   help="Reverse phase-encode b=0 volume for topup")
+                   help="Reverse phase-encode b=0 volume(s) for topup "
+                        "(4-D inputs are averaged)")
     p.add_argument("--no_topup", action="store_true",
                    help="Skip topup even if --rpe_b0 is supplied")
     p.add_argument("--readout_time", type=float, default=0.05,
                    help="Total readout time in seconds for topup/eddy "
-                        "acqparams.txt. Scanner- and sequence-dependent — "
-                        "derive from DICOM headers as EffectiveEchoSpacing "
-                        "x (PhaseEncodingSteps - 1). Default 0.05s is a "
-                        "placeholder, not a measured value; set this "
-                        "explicitly for real data. (default: %(default)s)")
+                        "acqparams.txt (BIDS: TotalReadoutTime). Scanner- "
+                        "and sequence-dependent — derive from DICOM headers "
+                        "as EffectiveEchoSpacing x (PhaseEncodingSteps - 1). "
+                        "Default 0.05s is a placeholder, not a measured "
+                        "value; set this explicitly for real data. "
+                        "(default: %(default)s)")
+    p.add_argument("--registration", choices=["flirt", "epi_reg", "ants"],
+                   default=None,
+                   help="T1→DWI registration: flirt (6-DOF, default), "
+                        "epi_reg (FSL boundary-based) or ants (rigid+affine)")
     p.add_argument("--use_ants", action="store_true",
-                   help="Use ANTs rigid+affine for T1→DWI registration "
-                        "(default: FLIRT 6-DOF)")
+                   help="Alias for --registration ants")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip preprocessing stages whose outputs already "
+                        "exist in --out")
+    p.add_argument("--n_threads", type=int, default=0,
+                   help="Threads for MRtrix3 tools and eddy (0 = default)")
+    p.add_argument("--eddy_gpu", action="store_true",
+                   help="Use a CUDA build of eddy if available")
 
-    # --- Skip preprocessing (use pre-computed eigenvalues) ---
+    # --- Run modes ---
+    p.add_argument("--skip_dwi_preproc", action="store_true",
+                   help="Input DWI is already preprocessed (denoised, "
+                        "distortion/eddy corrected; final bvecs): skip "
+                        "straight to tensor fit. Needs --dwi --bval --bvec "
+                        "and --mask (or FSL bet)")
     p.add_argument("--skip_preproc", action="store_true",
                    help="Skip preprocessing and tensor estimation; "
                         "requires --l1 --l2 --l3 --mask")
@@ -934,7 +1148,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--l3",   type=Path, default=None,
                    help="Pre-computed λ₃ NIfTI (use with --skip_preproc)")
     p.add_argument("--mask", type=Path, default=None,
-                   help="Brain mask NIfTI (use with --skip_preproc)")
+                   help="Brain mask NIfTI (--skip_preproc / "
+                        "--skip_dwi_preproc)")
     p.add_argument("--fa", type=Path, default=None,
                    help="Pre-computed FA NIfTI, for QC plots (use with "
                         "--skip_preproc). Overrides dtifit-naming "
@@ -944,7 +1159,30 @@ def parse_args() -> argparse.Namespace:
                    help="Pre-computed MD NIfTI, for QC plots (use with "
                         "--skip_preproc). Same override behavior as --fa.")
 
-    # --- Optional pre-computed PVE maps ---
+    # --- Tensor estimation ---
+    p.add_argument("--tensor_fit", choices=["dtifit", "python"],
+                   default="dtifit",
+                   help="Tensor fitting backend: FSL dtifit (default) or the "
+                        "native NumPy fit (no FSL needed)")
+    p.add_argument("--wls", action="store_true",
+                   help="Weighted least squares instead of ordinary least "
+                        "squares; fewer negative eigenvalues in noisy data")
+    p.add_argument("--max_b", type=float, default=None,
+                   help="Fit only volumes with b <= this value (b=0 kept). "
+                        "Use for multi-shell data or to drop high-b shells "
+                        "(DTI assumes b <= ~1000-1500)")
+
+    # --- Quality control / outputs ---
+    p.add_argument("--snr", type=Path, default=None,
+                   help="Optional SNR map (NIfTI) for --min_snr when not "
+                        "running full preprocessing (which derives it from "
+                        "the dwidenoise noise map)")
+    p.add_argument("--min_snr", type=float, default=0.0,
+                   help="Set NDE to NaN (QC flag 2) where SNR < this value "
+                        "(0 = off). NDE is biased low at low SNR")
+    p.add_argument("--nde_only", action="store_true",
+                   help="Write only the NDE map (skip tensor mode and "
+                        "Westin shape maps)")
     p.add_argument("--pve_csf", type=Path, default=None,
                    help="CSF partial volume estimate (DWI space)")
     p.add_argument("--pve_gm",  type=Path, default=None,
@@ -955,7 +1193,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--verbose", action="store_true",
                    help="Enable DEBUG logging")
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def _validate_shapes(named_paths: dict) -> None:
@@ -968,6 +1206,8 @@ def _validate_shapes(named_paths: dict) -> None:
             log.error("%s: file not found: %s", name, path)
             sys.exit(1)
         shapes[name] = tuple(nib.load(str(path)).shape)
+    if not shapes:
+        return
     ref_name = next(iter(shapes))
     for name, shp in shapes.items():
         if shp != shapes[ref_name]:
@@ -977,8 +1217,13 @@ def _validate_shapes(named_paths: dict) -> None:
             sys.exit(1)
 
 
-def main() -> None:
-    args = parse_args()
+def _fail(msg: str, *a) -> None:
+    log.error(msg, *a)
+    sys.exit(1)
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -987,15 +1232,40 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("=" * 60)
-    log.info("  NDE Pipeline — Normalized Diffusion Entropy")
+    log.info("  NDE Pipeline — Normalized Diffusion Entropy  (v%s)",
+             __version__)
     log.info("=" * 60)
     log.info("Output directory: %s", out_dir)
 
+    if args.skip_preproc and args.skip_dwi_preproc:
+        _fail("--skip_preproc and --skip_dwi_preproc are mutually exclusive.")
+    run_mode = ("eigenvalues" if args.skip_preproc else
+                "dwi_preprocessed" if args.skip_dwi_preproc else "full")
+    registration = args.registration or ("ants" if args.use_ants else None)
+
     # ------------------------------------------------------------------
-    # Validate external tools
+    # Per-mode input checks and tool validation
     # ------------------------------------------------------------------
-    if not args.skip_preproc:
-        validate_tools(use_ants=args.use_ants)
+    if run_mode != "eigenvalues":
+        need = [("--dwi", args.dwi), ("--bval", args.bval),
+                ("--bvec", args.bvec)]
+        if run_mode == "full":
+            need.append(("--t1", args.t1))
+        missing = [n for n, v in need if v is None]
+        if missing:
+            _fail("This run mode requires: %s", ", ".join(missing))
+        try:
+            dwi_info = nerves_dti.validate_dwi_inputs(
+                args.dwi, args.bval, args.bvec)
+        except ValueError as e:
+            _fail("Invalid DWI input: %s", e)
+        validate_tools(
+            use_ants=args.use_ants, registration=registration,
+            eddy_gpu=args.eddy_gpu, tensor_fit=args.tensor_fit,
+            skip_dwi_preproc=(run_mode == "dwi_preprocessed"),
+            has_t1=(args.t1 is not None))
+    else:
+        dwi_info = None
 
     # ------------------------------------------------------------------
     # Track paths that feed into downstream steps
@@ -1009,50 +1279,101 @@ def main() -> None:
     pve_csf   = args.pve_csf
     pve_gm    = args.pve_gm
     pve_wm    = args.pve_wm
+    snr_path  = args.snr
+    extra = {"run_mode": run_mode}
+    if dwi_info is not None:
+        extra["acquisition"] = {k: dwi_info[k] for k in
+                                ("n_volumes", "n_b0", "n_dw", "shells")}
 
-    if not args.skip_preproc:
-        # --------------------------------------------------------------
-        # Step 2: DWI preprocessing
-        # --------------------------------------------------------------
-        rpe_b0 = None if args.no_topup else args.rpe_b0
-        preproc = preprocess_dwi(
-            dwi=args.dwi, bval=args.bval, bvec=args.bvec,
-            out_dir=out_dir / "preproc",
-            pe_dir=args.pe_dir,
-            rpe_b0=rpe_b0,
-            readout_time=args.readout_time,
-        )
-        mask_path = preproc["mask"]
+    if run_mode in ("full", "dwi_preprocessed"):
+        preproc_dir = out_dir / "preproc"
+        if run_mode == "full":
+            # ----------------------------------------------------------
+            # Step 2: DWI preprocessing
+            # ----------------------------------------------------------
+            rpe_b0 = None if args.no_topup else args.rpe_b0
+            preproc = preprocess_dwi(
+                dwi=args.dwi, bval=args.bval, bvec=args.bvec,
+                out_dir=preproc_dir, pe_dir=args.pe_dir, rpe_b0=rpe_b0,
+                readout_time=args.readout_time, resume=args.resume,
+                n_threads=args.n_threads, eddy_gpu=args.eddy_gpu,
+            )
+            mask_path = preproc["mask"]
+            fit_dwi, fit_bvecs, fit_bvals = (
+                preproc["dwi_eddy"], preproc["bvecs"], preproc["bvals"])
+            ref_b0 = preproc["mean_b0"]
+            ref_b0_brain = preproc["mean_b0_brain"]
+            if snr_path is None and preproc.get("noise_map") is not None:
+                try:
+                    snr_info = nerves_dti.compute_snr_map(
+                        ref_b0, preproc["noise_map"], mask_path,
+                        preproc_dir / "snr_map.nii.gz")
+                    snr_path = snr_info["path"]
+                    extra["snr"] = snr_info["stats"]
+                    log.info("Median b=0 SNR in mask: %.1f",
+                             snr_info["stats"].get("snr_median", float("nan")))
+                except ValueError as e:
+                    log.warning("SNR map not computed: %s", e)
+        else:
+            # ----------------------------------------------------------
+            # Preprocessed DWI supplied: mean b0, mask, then fit
+            # ----------------------------------------------------------
+            preproc_dir.mkdir(parents=True, exist_ok=True)
+            fit_dwi, fit_bvecs, fit_bvals = args.dwi, args.bvec, args.bval
+            ref_b0 = nerves_dti.mean_b0_numpy(
+                args.dwi, args.bval, preproc_dir / "mean_b0.nii.gz")
+            if mask_path is None:
+                if not check_tool("bet"):
+                    _fail("--skip_dwi_preproc needs --mask (FSL bet not "
+                          "found to create one).")
+                brain = preproc_dir / "mean_b0_brain"
+                run(["bet", ref_b0, brain, "-m", "-f", "0.3"])
+                mask_path = preproc_dir / "mean_b0_brain_mask.nii.gz"
+            _validate_shapes({"--dwi (b0 grid)": ref_b0, "--mask": mask_path})
+            ref_b0_brain = None
+            if registration == "epi_reg" and args.t1 is not None:
+                ref_b0_brain = preproc_dir / "mean_b0_masked.nii.gz"
+                run(["fslmaths", ref_b0, "-mas", mask_path, ref_b0_brain])
 
         # --------------------------------------------------------------
-        # Step 3: T1 preprocessing and registration
+        # Step 3: T1 preprocessing and registration (if a T1 is available)
         # --------------------------------------------------------------
-        t1_results = preprocess_t1(
-            t1=args.t1,
-            dwi_ref=preproc["mean_b0"],
-            out_dir=out_dir / "t1",
-            use_ants=args.use_ants,
-        )
-        pve_csf = t1_results["pve_csf"]
-        pve_gm  = t1_results["pve_gm"]
-        pve_wm  = t1_results["pve_wm"]
+        if args.t1 is not None:
+            t1_results = preprocess_t1(
+                t1=args.t1, dwi_ref=ref_b0, out_dir=out_dir / "t1",
+                use_ants=args.use_ants, registration=registration,
+                dwi_ref_brain=ref_b0_brain, resume=args.resume,
+            )
+            pve_csf = t1_results["pve_csf"]
+            pve_gm  = t1_results["pve_gm"]
+            pve_wm  = t1_results["pve_wm"]
+        else:
+            log.info("No T1 supplied: tissue-specific QC will be skipped.")
 
         # --------------------------------------------------------------
-        # Step 4: Tensor estimation
+        # Optional shell selection, then Step 4: tensor estimation
         # --------------------------------------------------------------
-        tensor_dir = out_dir / "tensor"
+        if args.max_b is not None:
+            try:
+                sel = nerves_dti.select_shells(
+                    fit_dwi, fit_bvecs, fit_bvals, args.max_b,
+                    out_dir / "preproc" / "shells")
+            except ValueError as e:
+                _fail("%s", e)
+            fit_dwi, fit_bvecs, fit_bvals = (
+                sel["dwi"], sel["bvecs"], sel["bvals"])
+            extra["max_b"] = args.max_b
         tensor = estimate_tensor(
-            dwi=preproc["dwi_eddy"],
-            bvecs=preproc["bvecs"],
-            bvals=preproc["bvals"],
-            mask=mask_path,
-            out_dir=tensor_dir,
+            dwi=fit_dwi, bvecs=fit_bvecs, bvals=fit_bvals, mask=mask_path,
+            out_dir=out_dir / "tensor", wls=args.wls,
+            method=args.tensor_fit, resume=args.resume,
         )
         l1_path = tensor["l1"]
         l2_path = tensor["l2"]
         l3_path = tensor["l3"]
         fa_path = tensor["fa"]
         md_path = tensor["md"]
+        extra["tensor_fit"] = {"backend": args.tensor_fit, "wls": args.wls}
 
     else:
         # Validate that all required pre-computed files were supplied
@@ -1066,6 +1387,7 @@ def main() -> None:
         _validate_shapes({"--l1": l1_path, "--l2": l2_path,
                           "--l3": l3_path, "--mask": mask_path,
                           "--fa": args.fa, "--md": args.md,
+                          "--snr": args.snr,
                           "--pve_csf": pve_csf, "--pve_gm": pve_gm,
                           "--pve_wm": pve_wm})
         # Derive FA / MD paths if they exist alongside the eigenvalues
@@ -1099,7 +1421,7 @@ def main() -> None:
                         "different names.")
 
     # ------------------------------------------------------------------
-    # Step 5: NDE computation
+    # Step 5: NDE computation (+ companion shape maps)
     # ------------------------------------------------------------------
     nde_dir = out_dir / "nde"
     nde_result = compute_nde(
@@ -1108,7 +1430,16 @@ def main() -> None:
         l3_path=l3_path,
         mask_path=mask_path,
         out_dir=nde_dir,
+        snr_path=snr_path,
+        min_snr=args.min_snr,
     )
+    if not args.nde_only:
+        shape = nerves_dti.compute_shape_metrics(
+            l1_path, l2_path, l3_path, mask_path, out_dir / "shape",
+            qc_flag_path=nde_result["qc_flag"])
+        extra["shape_statistics"] = shape["stats"]
+        log.info("Shape maps written: %s",
+                 ", ".join(sorted(shape["paths"])))
 
     # ------------------------------------------------------------------
     # Step 6: Quality control
@@ -1139,6 +1470,8 @@ def main() -> None:
         nde_stats=nde_result["stats"],
         qc_results=qc_results,
         args_dict={k: str(v) for k, v in vars(args).items()},
+        versions=collect_versions(),
+        extra=extra,
     )
 
     # ------------------------------------------------------------------
