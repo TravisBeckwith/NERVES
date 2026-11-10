@@ -8,6 +8,21 @@ NERVES uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (v2.0.0-dev)
+- **`nerves_qc.py`**: tensor-fit health and scalar-reliability QC for QSIRecon
+  (DSI Studio / TORTOISE / DIPY tensor scalars) and NERVES/FSL `dti_*` outputs.
+  Non-physical voxel, FA-saturation, MD-plausibility and MD/AD/RD consistency checks;
+  expected FA/MD/mode/NDE error at the subject's SNR; robust-z group outlier flags;
+  TSV, JSON and HTML output; exit code 3 on failure.
+- **`nerves_reliability.py`**: Monte-Carlo bias/SD calculator for FA, MD, tensor mode
+  and NDE versus SNR, directions, b-value and tissue; `--required METRIC:TOL` finds the
+  minimum SNR for a target accuracy.
+- `docs/reliability.md`, `tests/test_qc.py` (29 tests).
+
+### Changed (v2.0.0-dev)
+- Project reframed around tensor-fit QC and reliability; NDE remains available as an
+  optional, exploratory metric. Pipeline version is now 2.0.0-dev.
+
 ### Added (v1.1.0-dev)
 - **Companion shape maps** written by default: tensor mode and Westin cl/cp/cs
   (`shape/`), defined on the same voxels as NDE (`--nde_only` disables). Motivated by

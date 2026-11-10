@@ -11,9 +11,9 @@
 [![FSL](https://img.shields.io/badge/requires-FSL%206.0%2B-blueviolet)](https://fsl.fmrib.ox.ac.uk/)
 [![MRtrix3](https://img.shields.io/badge/requires-MRtrix3%203.0%2B-blueviolet)](https://www.mrtrix.org/)
 
-**A microstructural diffusion MRI pipeline for computing Normalized Diffusion Entropy (NDE) maps from T1 and DWI data.**
+**Tensor-fit QC and scalar-reliability tools for diffusion MRI, plus a pipeline for Normalized Diffusion Entropy (NDE) and tensor-shape maps.**
 
-[Installation](#installation) · [Quick Start](#quick-start) · [Documentation](#documentation) · [Citation](#citation)
+[Reliability & QC](#reliability--qc-tools) · [Installation](#installation) · [Quick Start](#quick-start) · [Documentation](#documentation) · [Citation](#citation)
 
 </div>
 
@@ -68,6 +68,38 @@ $$\text{NDE} = \frac{H}{\ln(3)}$$
 - **NDE = 1** → perfectly isotropic (λ₁ = λ₂ = λ₃)  
 - **NDE → 0** → maximally anisotropic (all diffusion along one eigenvector)
 - **NDE = NaN** → undefined: at least one eigenvalue ≤ 0 (flagged in `nde_qc_flag.nii.gz`)
+
+---
+
+## Reliability & QC tools
+
+New in v2. Both need only Python (NumPy, SciPy, nibabel), no FSL or MRtrix3. Details in
+[docs/reliability.md](docs/reliability.md).
+
+**1. `nerves_qc.py` — is this subject's tensor fit trustworthy?** Reads tensor maps you
+already have (QSIRecon DSI Studio / TORTOISE / DIPY workflows, or NERVES/FSL `dti_*`
+outputs) and reports non-physical voxels, FA saturation, MD plausibility, MD/AD/RD
+consistency, expected error at the subject's SNR, and group outliers (robust z-scores).
+Writes TSV, JSON and an HTML report.
+
+```bash
+python nerves_qc.py /path/to/derivatives --snr 20 --dirs 30 --b 1000
+```
+
+**2. `nerves_reliability.py` — how much can FA, MD, mode and NDE be trusted at this SNR?**
+Monte-Carlo (Rician noise, the pipeline's own tensor fit) for protocol planning:
+
+```bash
+python nerves_reliability.py --sweep-snr 10 20 40 --tissue GM
+python nerves_reliability.py --required FA:0.03 --tissue GM
+```
+
+Key findings at 30 directions, b = 1000 (OLS): FA in low-FA tissue is biased upward at
+low SNR (GM-like FA 0.19 reads +0.087 at SNR 10; WM shows no bias); MD is essentially
+unbiased; tensor mode has a voxelwise SD of 0.3–0.6 in low-FA tissue even at SNR 40, so
+it should not be interpreted there. Reaching |bias|, SD ≤ 0.03 in FA needs SNR ≈ 40 in
+GM-like tissue versus ≈ 25 in WM. These are simulation results with a single tissue
+tensor, not in-vivo measurements.
 
 ---
 
@@ -308,6 +340,7 @@ standard acquisition; it supports "NDE adds little", not a final verdict. See
 ## Documentation
 
 - [Installation Guide](docs/installation.md)
+- [Reliability & QC tools](docs/reliability.md)
 - [Pipeline Parameters](docs/parameters.md)
 - [NDE Theory](docs/theory.md)
 - [QC Interpretation](docs/qc_guide.md)
