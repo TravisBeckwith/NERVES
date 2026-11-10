@@ -19,6 +19,20 @@ NERVES uses [Semantic Versioning](https://semver.org/).
   minimum SNR for a target accuracy.
 - `docs/reliability.md`, `tests/test_qc.py` (29 tests).
 
+### Fixed (v2.0.0-dev, hardening pass)
+- `nerves_qc.py` compared sets from different spaces/models in one workflow folder as a
+  single group, hiding real outliers; groups are now workflow + model/space.
+- Intermediate copies under `work/`, `sourcedata/`, `log(s)/`, `figures/`, `tmp/` were
+  treated as results; they are now skipped. Workflow label now uses the
+  `qsirecon-<workflow>` folder, also in nested layouts.
+- FA/MD/AD/RD maps with different affines passed silently; now a FAIL.
+- Implausible median MD (wrong units or failed fit) went unflagged; now warns.
+- FSL dtifit outputs with a custom `-o` basename were not discovered.
+- Removed a reported-but-unused, misleading "axial FA difference" metric.
+- Both CLIs now reject bad arguments with a clear message instead of a traceback.
+- README and installation docs claimed Python 3.8; now >= 3.10 to match CI.
+- 19 more tests (143 total), including the report/SNR lookup that was untested.
+
 ### Changed (v2.0.0-dev)
 - Project reframed around tensor-fit QC and reliability; NDE remains available as an
   optional, exploratory metric. Pipeline version is now 2.0.0-dev.

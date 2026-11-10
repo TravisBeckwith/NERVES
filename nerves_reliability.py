@@ -184,9 +184,19 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     tissue: Union[str, Sequence[float]] = a.tissue
-    if "," in a.tissue:
-        tissue = [float(x) for x in a.tissue.split(",")]
-    lam = _resolve_tissue(tissue)
+    try:
+        if "," in a.tissue:
+            tissue = [float(x) for x in a.tissue.split(",")]
+        lam = _resolve_tissue(tissue)
+    except ValueError as exc:
+        ap.error(f"--tissue: {exc}")
+    if a.dirs < 6:
+        ap.error("--dirs must be >= 6")
+    if a.b <= 0:
+        ap.error("--b must be positive")
+    if a.snr is not None and a.snr <= 0 or \
+            any(x <= 0 for x in (a.sweep_snr or [])):
+        ap.error("SNR values must be positive")
     t = ns.true_metrics(lam)
     print(f"Tissue {a.tissue} λ={lam} → truth FA={t['FA']:.3f} "
           f"MD={t['MD']:.3f} MODE={t['MODE']:.3f} NDE={t['NDE']:.3f}; "
@@ -194,9 +204,19 @@ def main(argv=None) -> int:
 
     if a.required:
         metric, _, tol = a.required.partition(":")
-        s = min_snr_for_bias(metric, float(tol), a.dirs, a.b, tissue,
+        try:
+            tol_f = float(tol)
+            if tol_f <= 0:
+                raise ValueError
+            metric = metric.upper()
+            if metric not in METRICS:
+                raise ValueError
+        except ValueError:
+            ap.error("--required must look like METRIC:TOL with METRIC in "
+                     f"{'/'.join(METRICS)} and TOL > 0, e.g. FA:0.02")
+        s = min_snr_for_bias(metric, tol_f, a.dirs, a.b, tissue,
                              a.method, a.n, a.seed)
-        print(f"Minimum SNR for |bias|,SD of {metric.upper()} ≤ {tol}: "
+        print(f"Minimum SNR for |bias|,SD of {metric} ≤ {tol_f:g}: "
               + (f"{s:g}" if s is not None else "not reached on grid (>150)"))
         return 0 if s is not None else 1
 

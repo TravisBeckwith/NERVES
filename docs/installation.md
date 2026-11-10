@@ -146,5 +146,5 @@ Your virtual environment is not activated, or `pip install -r requirements.txt`
 was not run. Activate the environment and reinstall.
 
 **Python version error**
-NERVES requires Python ≥ 3.8. Check with `python --version`. On systems
+NERVES requires Python ≥ 3.10. Check with `python --version`. On systems
 where Python 3 is invoked as `python3`, use `python3 nde_pipeline.py`.
