@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 .venv/
 *:Zone.Identifier
+
+# default output folder of nerves_qc.py when run in the repo root
+/nerves_qc/
