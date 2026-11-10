@@ -60,32 +60,68 @@ MD_MAX_PLAUSIBLE = 4.0           # 1e-3 mm^2/s; free water is ~3
 QSIRECON_RE = re.compile(
     r"^(?P<prefix>.+)_param-(?P<param>[A-Za-z0-9]+)_dwimap\.nii(\.gz)?$")
 NII_SUFFIX = re.compile(r"\.nii(\.gz)?$")
-FSL_NAMES = {"dti_FA": "fa", "dti_MD": "md", "dti_L1": "l1",
-             "dti_L2": "l2", "dti_L3": "l3"}
+FSL_RE = re.compile(
+    r"^(?P<prefix>.*?)_?(?P<param>FA|MD|L1|L2|L3)\.nii(\.gz)?$")
+FSL_PARAMS = {"FA": "fa", "MD": "md", "L1": "l1", "L2": "l2", "L3": "l3"}
 KNOWN = {"fa", "md", "ad", "rd", "l1", "l2", "l3"}
+# Directories never searched (relative to the derivatives root): nipype
+# work trees, raw/source data, logs and figures can hold intermediate copies.
+EXCLUDE_DIRS = {"work", "sourcedata", "log", "logs", "figures", ".git",
+                "tmp"}
+ENTITY_RE = re.compile(r"(?:^|_)(?:sub|ses|run)-[A-Za-z0-9]+(?=_|$)")
+MD_TYPICAL_RANGE = (0.3, 2.0)    # 1e-3 mm^2/s; median brain MD incl. infants
 
 
 # ---------------------------------------------------------------- discovery
+def _workflow_of(parts) -> str:
+    """QSIRecon workflow folder name from the path parts under the root:
+    the last ``qsirecon-<workflow>`` part, else a bare ``qsirecon`` part."""
+    hyph = [x for x in parts if x.startswith("qsirecon-")]
+    if hyph:
+        return hyph[-1]
+    return "qsirecon" if "qsirecon" in parts else ""
+
+
 def discover(root: Path) -> Dict[str, Dict[str, Path]]:
     """Map ``label -> {param: path}`` for every tensor scalar set under
     ``root``. QSIRecon files group by (workflow folder, filename prefix);
-    FSL/NERVES ``dti_*`` files group by directory."""
+    FSL/NERVES ``*_FA/_MD/_L1-3`` (dtifit, default ``dti_*``) files group by
+    (directory, basename). Directories in ``EXCLUDE_DIRS`` are skipped."""
     root = Path(root)
     found: Dict[str, Dict[str, Path]] = {}
     for p in sorted(root.rglob("*.nii*")):
-        name = p.name
-        m = QSIRECON_RE.match(name)
+        rel_parts = p.parent.relative_to(root).parts
+        if any(x in EXCLUDE_DIRS for x in rel_parts):
+            continue
+        m = QSIRECON_RE.match(p.name)
         if m and m.group("param").lower() in KNOWN:
-            rp = p.parent.relative_to(root).parts
-            wf = next((x for x in rp if x.startswith("qsirecon")), "")
+            wf = _workflow_of(rel_parts)
             label = f"{wf}/{m.group('prefix')}" if wf else m.group("prefix")
             found.setdefault(label, {})[m.group("param").lower()] = p
             continue
-        stem = NII_SUFFIX.sub("", name)
-        if stem in FSL_NAMES:
-            label = str(p.parent.relative_to(root)) or "."
-            found.setdefault(label, {})[FSL_NAMES[stem]] = p
+        f = FSL_RE.match(p.name)
+        if f:
+            d = str(p.parent.relative_to(root)) or "."
+            pre = f.group("prefix")
+            label = d if pre in ("", "dti") else f"{d}/{pre}"
+            found.setdefault(label, {})[FSL_PARAMS[f.group("param")]] = p
     return {k: v for k, v in found.items() if "fa" in v and "md" in v}
+
+
+def group_key(paths: Dict[str, Path]) -> str:
+    """Key under which sets are compared for group outliers: workflow plus
+    filename prefix with sub-/ses-/run- entities removed (so ACPC and MNI
+    space, or tensor and DKI models, are never mixed)."""
+    p = next(iter(paths.values()))
+    m = QSIRECON_RE.match(p.name)
+    if m:
+        stem = m.group("prefix")
+        wf = _workflow_of(p.parts)
+    else:
+        f = FSL_RE.match(p.name)
+        stem = f.group("prefix") if f else NII_SUFFIX.sub("", p.name)
+        wf = "fsl"
+    return f"{wf}|{ENTITY_RE.sub('', stem).strip('_')}"
 
 
 def _load(path: Path) -> np.ndarray:
@@ -117,6 +153,17 @@ def analyse_subject(paths: Dict[str, Path], snr: Optional[float] = None,
     md = _load(paths["md"])
     if fa.shape != md.shape:
         raise ValueError(f"FA {fa.shape} and MD {md.shape} grids differ")
+    ref_aff = nib.load(str(paths["fa"])).affine
+    for k, pth in paths.items():
+        if k == "fa":
+            continue
+        img = nib.load(str(pth))
+        if img.shape != fa.shape:
+            raise ValueError(f"{k.upper()} {img.shape} and FA {fa.shape} "
+                             "grids differ")
+        if not np.allclose(img.affine, ref_aff, atol=1e-3):
+            raise ValueError(f"{k.upper()} affine differs from FA "
+                             "(maps are not on the same grid)")
 
     inb = np.isfinite(md) & (md != 0)                  # inferred brain mask
     n = int(inb.sum())
@@ -145,14 +192,6 @@ def analyse_subject(paths: Dict[str, Path], snr: Optional[float] = None,
             resid = np.abs(mdv[good] - (adv[good] + 2 * rdv[good]) / 3) \
                 / mdv[good]
             row["consistency_md_ad_rd"] = float(np.median(resid))
-            # FA implied by (AD, RD) under axial symmetry
-            ad_, rd_ = adv[good], rdv[good]
-            den = np.sqrt(ad_ ** 2 + 2 * rd_ ** 2)
-            fa_imp = np.sqrt(1.5) * np.sqrt(
-                (ad_ - mdv[good]) ** 2 + 2 * (rd_ - mdv[good]) ** 2) \
-                / np.where(den > 0, den, np.nan)
-            row["fa_vs_axial_fa_median_abs_diff"] = float(
-                np.nanmedian(np.abs(fav[good] - fa_imp)))
         if row.get("consistency_md_ad_rd", 0) > WARN_CONSISTENCY:
             flags.append("MD inconsistent with (AD+2RD)/3: median error "
                          f"{row['consistency_md_ad_rd']:.1%}")
@@ -196,6 +235,12 @@ def analyse_subject(paths: Dict[str, Path], snr: Optional[float] = None,
     if row.get("frac_fa_saturated", 0) > WARN_FA_SATURATED_FRAC:
         flags.append(f"FA >= 0.99 in {row['frac_fa_saturated']:.1%} of "
                      "voxels (noise floor / fit failure)")
+    md_med = row.get("md_median")
+    if md_med is not None and not (MD_TYPICAL_RANGE[0] <= md_med
+                                   <= MD_TYPICAL_RANGE[1]):
+        flags.append(f"median MD {md_med:.3g}e-3 mm^2/s is outside the "
+                     f"typical {MD_TYPICAL_RANGE[0]}-{MD_TYPICAL_RANGE[1]} "
+                     "range (wrong units or failed fit?)")
     if row.get("frac_md_implausible", 0) > 0.05:
         flags.append(f"MD > {MD_MAX_PLAUSIBLE:g}e-3 in "
                      f"{row['frac_md_implausible']:.1%} of voxels")
@@ -247,11 +292,12 @@ def robust_z(values: np.ndarray) -> np.ndarray:
 
 def flag_outliers(rows: List[dict], z_thresh: float = OUTLIER_Z) -> None:
     """Add ``z_<metric>`` and outlier flags in place. Needs
-    ``MIN_GROUP_FOR_OUTLIERS`` subjects sharing the same workflow label
-    prefix (compared within workflow)."""
+    ``MIN_GROUP_FOR_OUTLIERS`` sets sharing the same ``group`` key (workflow
+    + model/space; sessions of one subject count as separate sets)."""
     by_wf: Dict[str, List[dict]] = {}
     for r in rows:
-        by_wf.setdefault(r.get("workflow", ""), []).append(r)
+        by_wf.setdefault(r.get("group", r.get("workflow", "")),
+                         []).append(r)
     for grp in by_wf.values():
         if len(grp) < MIN_GROUP_FOR_OUTLIERS:
             continue
@@ -347,6 +393,7 @@ def run(root: Path, out: Path, snr: Optional[float] = None,
                    "n_voxels": 0}
         row["label"] = label
         row["workflow"] = _workflow(label)
+        row["group"] = group_key(paths)
         rows.append(row)
     flag_outliers(rows)
     out = Path(out)
@@ -372,6 +419,14 @@ def main(argv=None) -> int:
     ap.add_argument("--method", choices=["ols", "wls"], default="ols",
                     help="Tensor fit used to compute expected error")
     a = ap.parse_args(argv)
+    if not a.root.is_dir():
+        ap.error(f"{a.root} is not a directory")
+    if a.snr is not None and a.snr <= 0:
+        ap.error("--snr must be positive")
+    if a.dirs < 6:
+        ap.error("--dirs must be >= 6")
+    if a.b <= 0:
+        ap.error("--b must be positive")
 
     rows = run(a.root, a.out or (a.root / "nerves_qc"), a.snr, a.dirs, a.b,
                a.method)

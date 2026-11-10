@@ -79,8 +79,18 @@ python nerves_qc.py /path/to/derivatives --snr 20 --dirs 30 --b 1000
 * **QSIRecon** tensor scalars: `*_model-tensor_param-{fa,md,ad,rd}_dwimap.nii.gz`
   (DSI Studio, TORTOISE, DIPY workflows). Each (workflow folder, filename prefix) is one
   set. Optional `l1/l2/l3` parameters enable eigenvalue checks and NDE/mode medians.
-* **FSL / NERVES**: `dti_FA`, `dti_MD`, `dti_L1/L2/L3` in the same directory.
-  A `nde_pipeline_report.json` beside them supplies the SNR automatically.
+* **FSL / NERVES**: `<name>_FA`, `<name>_MD`, `<name>_L1/L2/L3` in the same directory
+  (dtifit's default name is `dti`; any `-o` basename works). A set needs FA and MD with
+  the same basename. A `nde_pipeline_report.json` in the same directory or its parent
+  supplies the SNR automatically; `--snr` overrides it. The report's SNR is the median
+  b = 0 SNR over the brain mask, which probably overstates tissue SNR slightly
+  (CSF is bright at b = 0); this has not been quantified.
+
+`work/`, `sourcedata/`, `log/`, `logs/`, `figures/`, `tmp/` and `.git/` folders under the
+root are never searched, so intermediate pipeline copies are not mistaken for results.
+The QSIRecon workflow is taken from the last `qsirecon-<workflow>` folder in the path.
+**Not yet verified on real QSIRecon output**; the matching follows the documented
+`..._model-tensor_param-<fa|md|ad|rd>_dwimap` naming.
 
 A set needs at least FA and MD. The brain mask is inferred from voxels with finite,
 non-zero MD. MD units (mm²/s vs 10⁻³ mm²/s) are detected automatically.
@@ -92,11 +102,18 @@ non-zero MD. MD units (mm²/s vs 10⁻³ mm²/s) are detected automatically.
 | Non-physical voxels (FA outside [0,1], MD ≤ 0, RD < 0, AD < RD, eigenvalue ≤ 0) | > 1 % | > 5 % |
 | FA ≥ 0.99 (noise floor / failed fit) | > 2 % of voxels | |
 | MD > 4×10⁻³ mm²/s | > 5 % of voxels | |
+| Median MD outside 0.3–2.0 ×10⁻³ mm²/s (wrong units / failed fit) | warn | |
 | MD vs (AD+2·RD)/3 median relative error | > 5 % | |
+| FA/MD/AD/RD maps on different grids or affines | | error → FAIL |
 | Eigenvalues not sorted L1 ≥ L2 ≥ L3 | > 1 % | |
 | Expected GM-like FA bias at the given SNR | > 0.05 | |
 | Expected GM-like mode SD at the given SNR | > 0.5 | |
 | Group outlier (robust z, per workflow, ≥ 5 sets) | \|z\| > 3.5 | |
+
+Sets are compared only within a group: workflow plus filename prefix with
+`sub-`/`ses-`/`run-` removed, so ACPC and MNI space, or tensor and DKI models, are never
+mixed. Sessions of the same subject count as separate sets (this violates independence
+in longitudinal data; interpret flags accordingly).
 
 Group outlier metrics: mean FA, FA 95th percentile, median MD, non-physical fraction,
 FA-saturation fraction, fraction FA > 0.4, and median NDE when eigenvalues are

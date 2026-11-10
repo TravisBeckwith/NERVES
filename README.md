@@ -5,7 +5,7 @@
 # NERVES
 ### Normalized Entropy Representation of Voxelwise Eigenvalue Spectra
 
-[![Python](https://img.shields.io/badge/python-3.8%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19738588-orange)](https://doi.org/10.5281/zenodo.19738588)
 [![FSL](https://img.shields.io/badge/requires-FSL%206.0%2B-blueviolet)](https://fsl.fmrib.ox.ac.uk/)
@@ -143,7 +143,7 @@ Raw DWI + T1
 |---|---|---|
 | [FSL](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslInstallation) | ≥ 6.0 | Preprocessing, tensor estimation |
 | [MRtrix3](https://www.mrtrix.org/download/) | ≥ 3.0.3 | Denoising, Gibbs removal |
-| Python | ≥ 3.8 | NDE computation, QC |
+| Python | ≥ 3.10 | NDE computation, QC |
 | [ANTs](https://github.com/ANTsX/ANTs) | ≥ 2.3 | Optional: improved T1→DWI registration |
 
 ### Python Environment

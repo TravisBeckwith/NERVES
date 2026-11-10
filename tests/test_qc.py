@@ -297,3 +297,133 @@ class TestPipelineIntegration:
         assert row["n_voxels"] > 100
         assert row["frac_nonphysical"] < 0.05
         assert "nde_median" in row and "exp_GM_FA_bias" in row
+
+
+# ----------------------------------------------- real-layout hardening
+def _clone_space(root, src="ACPC", dst="MNI", scale=1.0):
+    """Copy every ``space-<src>`` map to ``space-<dst>``, scaling the
+    diffusivity maps (md/ad/rd/l1-3) by ``scale``."""
+    for f in list(root.rglob(f"*space-{src}*")):
+        arr = np.asarray(nib.load(str(f)).dataobj)
+        if any(f"param-{k}_" in f.name for k in ("md", "ad", "rd",
+                                                  "l1", "l2", "l3")):
+            arr = arr * scale
+        _write(Path(str(f).replace(f"space-{src}", f"space-{dst}")), arr)
+
+
+class TestRealLayoutHardening:
+    def test_work_and_source_dirs_are_not_searched(self, tmp_path):
+        make_subject(tmp_path, "sub-01")
+        make_subject(tmp_path / "work" / "qsirecon_wf", "sub-01")
+        make_subject(tmp_path / "sourcedata", "sub-01")
+        labels = list(qc.discover(tmp_path))
+        assert len(labels) == 1 and labels[0].startswith("qsirecon-DSIStudio/")
+
+    def test_nested_qsirecon_layout_uses_workflow_folder(self, tmp_path):
+        make_subject(tmp_path / "qsirecon" / "derivatives", "sub-01",
+                     wf="qsirecon-DIPYDKI")
+        (label,) = qc.discover(tmp_path)
+        assert label.startswith("qsirecon-DIPYDKI/")
+
+    def test_uppercase_params_and_ses_run_entities(self, tmp_path):
+        d = tmp_path / "qsirecon-TORTOISE" / "sub-01" / "ses-01" / "dwi"
+        for p in ("FA", "MD", "AD", "RD"):
+            _write(d / f"sub-01_ses-01_run-2_space-ACPC_model-tensor_"
+                       f"param-{p}_dwimap.nii.gz", np.full((4, 4, 4), 0.5))
+        (paths,) = qc.discover(tmp_path).values()
+        assert set(paths) == {"fa", "md", "ad", "rd"}
+        assert qc.group_key(paths) == \
+            "qsirecon-TORTOISE|space-ACPC_model-tensor"
+
+    def test_group_key_separates_spaces_and_models(self, tmp_path):
+        make_subject(tmp_path, "sub-01")
+        make_subject(tmp_path, "sub-02", seed=2)
+        _clone_space(tmp_path)
+        keys = {qc.group_key(v) for v in qc.discover(tmp_path).values()}
+        assert len(keys) == 2          # ACPC vs MNI, subjects merged
+
+    def test_outlier_found_despite_other_space_in_same_folder(self, tmp_path):
+        for i in range(6):
+            make_subject(tmp_path, f"sub-{i:02d}", seed=i,
+                         md_shift=3.0 if i == 5 else 1.0)
+        _clone_space(tmp_path, scale=1.6)   # second space, different MD
+        rows = qc.run(tmp_path, tmp_path / "qc")
+        flagged = {r["label"] for r in rows
+                   if any("group outlier" in f for f in r["flags"])}
+        # sub-05 is bad in both spaces and is judged within each space's group;
+        # no other set is flagged although the two spaces differ by 1.6x MD
+        assert flagged == {r["label"] for r in rows if "sub-05" in r["label"]}
+        assert len(flagged) == 2
+
+    def test_affine_mismatch_is_rejected(self, tmp_path):
+        make_subject(tmp_path, "sub-01")
+        paths = next(iter(qc.discover(tmp_path).values()))
+        aff = np.eye(4)
+        aff[0, 3] = 40
+        _write(paths["md"], np.asarray(nib.load(str(paths["md"])).dataobj),
+               affine=aff)
+        with pytest.raises(ValueError, match="affine"):
+            qc.analyse_subject(paths)
+        rows = qc.run(tmp_path, tmp_path / "qc")
+        assert rows[0]["status"] == "FAIL"
+
+    def test_atypical_md_median_is_flagged(self, tmp_path):
+        make_subject(tmp_path, "sub-01", md_shift=0.2)
+        r = qc.analyse_subject(next(iter(qc.discover(tmp_path).values())))
+        assert r["status"] == "WARN"
+        assert any("outside the typical" in f for f in r["flags"])
+
+    def test_custom_fsl_basename_discovered(self, tmp_path):
+        d = tmp_path / "sub-01"
+        for p in ("FA", "MD"):
+            _write(d / f"sub01_{p}.nii.gz", np.full((4, 4, 4), 0.7))
+        _write(d / "all_FA.nii.gz", np.full((4, 4, 4), 0.4))   # no MD: ignored
+        found = qc.discover(tmp_path)
+        assert list(found) == ["sub-01/sub01"]
+        assert qc.group_key(found["sub-01/sub01"]) == "fsl|sub01"
+
+
+class TestReportSnr:
+    def _report(self, d, snr):
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "nde_pipeline_report.json").write_text(
+            json.dumps({"snr": {"snr_median": snr}}))
+
+    def test_snr_taken_from_report_beside_maps(self, tmp_path):
+        make_subject(tmp_path, "sub-01", fsl_style=True)
+        self._report(tmp_path / "sub-01", 8.0)
+        (row,) = qc.run(tmp_path, tmp_path / "qc")
+        assert row["snr"] == 8.0
+        assert any("FA bias" in f for f in row["flags"])
+
+    def test_cli_snr_overrides_report(self, tmp_path):
+        make_subject(tmp_path, "sub-01", fsl_style=True)
+        self._report(tmp_path / "sub-01", 8.0)
+        (row,) = qc.run(tmp_path, tmp_path / "qc", snr=40.0)
+        assert row["snr"] == 40.0 and row["status"] == "PASS"
+
+    def test_report_not_borrowed_from_sibling_subject(self, tmp_path):
+        make_subject(tmp_path, "sub-01", fsl_style=True)
+        make_subject(tmp_path, "sub-02", fsl_style=True, seed=2)
+        self._report(tmp_path / "sub-01", 8.0)
+        rows = {r["label"]: r for r in qc.run(tmp_path, tmp_path / "qc")}
+        assert rows["sub-01"]["snr"] == 8.0
+        assert "snr" not in rows["sub-02"]
+
+
+class TestCliValidation:
+    def test_qc_rejects_bad_arguments(self, tmp_path, capsys):
+        for argv in ([str(tmp_path / "nope")], [str(tmp_path), "--snr", "-1"],
+                     [str(tmp_path), "--dirs", "3"]):
+            with pytest.raises(SystemExit) as e:
+                qc.main(argv)
+            assert e.value.code == 2
+
+    @pytest.mark.parametrize("argv", [
+        ["--required", "FA"], ["--required", "XX:0.1"],
+        ["--required", "FA:-1"], ["--tissue", "1.7,0.35"],
+        ["--tissue", "BONE"], ["--snr", "0"], ["--dirs", "4"]])
+    def test_reliability_rejects_bad_arguments(self, argv):
+        with pytest.raises(SystemExit) as e:
+            rel.main(argv)
+        assert e.value.code == 2
